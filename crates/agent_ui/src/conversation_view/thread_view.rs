@@ -654,6 +654,7 @@ enum ToolCallLayout {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExternalStatusSurfaceSummary {
+    pub kind: SharedString,
     pub label: SharedString,
     pub value: SharedString,
     pub details: Vec<SharedString>,
@@ -679,9 +680,16 @@ fn external_status_surface_summary(
         values.push(placement.clone());
     }
     let value = values.first().cloned()?;
-    let details = values.into_iter().skip(1).collect();
+    let mut details = values.into_iter().skip(1).collect::<Vec<_>>();
+    if !matches!(surface.kind.as_ref(), "status" | "persistent_status")
+        && let Some(placement) = surface.placement.as_ref()
+        && value != *placement
+    {
+        details.insert(0, format!("Placement: {}", placement.as_ref()).into());
+    }
 
     Some(ExternalStatusSurfaceSummary {
+        kind: surface.kind.clone(),
         label,
         value,
         details,
@@ -700,6 +708,24 @@ fn editor_text_content(surface: &ExternalStatusSurface) -> Option<Vec<acp::Conte
             text.to_string(),
         ))]
     })
+}
+
+fn external_status_surface_icon(kind: &str) -> IconName {
+    match kind {
+        "widget" => IconName::Blocks,
+        "title" => IconName::TextSnippet,
+        "status" | "persistent_status" => IconName::Circle,
+        _ => IconName::Info,
+    }
+}
+
+fn external_status_surface_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "widget" => "Widget",
+        "title" => "Title",
+        "status" | "persistent_status" => "Status",
+        _ => "Surface",
+    }
 }
 
 fn full_path_for_empty_project_path(file: &dyn language::File, cx: &App) -> Option<String> {
@@ -2809,7 +2835,7 @@ impl ThreadView {
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
                     .child(
-                        Label::new("Agent Status")
+                        Label::new("Agent Surfaces")
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
@@ -2818,6 +2844,8 @@ impl ThreadView {
             .child(
                 v_flex().children(summaries.into_iter().enumerate().map(|(ix, summary)| {
                     let is_last = ix == count - 1;
+                    let icon = external_status_surface_icon(&summary.kind);
+                    let kind = external_status_surface_kind_label(&summary.kind);
                     h_flex()
                         .id(("external-status-surface", ix))
                         .p_1()
@@ -2834,11 +2862,8 @@ impl ThreadView {
                             h_flex()
                                 .min_w_0()
                                 .gap_1p5()
-                                .child(
-                                    Icon::new(IconName::Circle)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Accent),
-                                )
+                                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Accent))
+                                .child(Label::new(kind).size(LabelSize::XSmall).color(Color::Muted))
                                 .child(Label::new(summary.label).size(LabelSize::Small).truncate()),
                         )
                         .child(
