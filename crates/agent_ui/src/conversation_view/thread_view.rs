@@ -712,7 +712,7 @@ fn editor_text_content(surface: &ExternalStatusSurface) -> Option<Vec<acp::Conte
 
 fn external_status_surface_icon(kind: &str) -> IconName {
     match kind {
-        "widget" => IconName::Blocks,
+        "widget" | "persistent_widget" => IconName::Blocks,
         "title" => IconName::TextSnippet,
         "status" | "persistent_status" => IconName::Circle,
         _ => IconName::Info,
@@ -721,7 +721,7 @@ fn external_status_surface_icon(kind: &str) -> IconName {
 
 fn external_status_surface_kind_label(kind: &str) -> &'static str {
     match kind {
-        "widget" => "Widget",
+        "widget" | "persistent_widget" => "Widget",
         "title" => "Title",
         "status" | "persistent_status" => "Status",
         _ => "Surface",

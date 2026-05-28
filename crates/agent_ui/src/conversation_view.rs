@@ -5674,6 +5674,26 @@ pub(crate) mod tests {
             thread
                 .handle_session_update(
                     acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new(
+                            "Pi widget [circle-persistent-panel]: persistent visible".into(),
+                        )
+                        .meta(acp::Meta::from_iter([(
+                            acp_thread::STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "persistent_widget",
+                                "key": "circle-persistent-panel",
+                                "text": "persistent visible",
+                                "placement": "below_editor",
+                                "lines": ["persistent detail"]
+                            }),
+                        )])),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
                         acp::ContentChunk::new("Pi notify: hello".into()).meta(
                             acp::Meta::from_iter([(
                                 acp_thread::STATUS_SURFACE_META_KEY.into(),
@@ -5716,7 +5736,7 @@ pub(crate) mod tests {
             let summaries = view.external_status_surface_summaries(cx);
             assert_eq!(
                 summaries.len(),
-                2,
+                3,
                 "transient notifications and editor text should not persist in the native surface summary"
             );
             assert_eq!(summaries[0].kind.as_ref(), "persistent_status");
@@ -5728,6 +5748,11 @@ pub(crate) mod tests {
             assert_eq!(summaries[1].value.as_ref(), "visible");
             assert_eq!(summaries[1].details[0].as_ref(), "Placement: activity_bar");
             assert_eq!(summaries[1].details[1].as_ref(), "detail");
+            assert_eq!(summaries[2].kind.as_ref(), "persistent_widget");
+            assert_eq!(summaries[2].label.as_ref(), "circle-persistent-panel");
+            assert_eq!(summaries[2].value.as_ref(), "persistent visible");
+            assert_eq!(summaries[2].details[0].as_ref(), "Placement: below_editor");
+            assert_eq!(summaries[2].details[1].as_ref(), "persistent detail");
             assert!(
                 view.render_activity_bar(window, cx).is_some(),
                 "external status/widget surfaces should render a native activity summary even without plan/edit/queue items",
@@ -5743,6 +5768,21 @@ pub(crate) mod tests {
                             json!({
                                 "kind": "persistent_status",
                                 "key": "circle",
+                                "clear": true
+                            }),
+                        )]),
+                    )),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("".into()).meta(
+                        acp::Meta::from_iter([(
+                            acp_thread::STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "persistent_widget",
+                                "key": "circle-persistent-panel",
                                 "clear": true
                             }),
                         )]),
