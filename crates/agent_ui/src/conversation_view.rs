@@ -3520,10 +3520,8 @@ pub(crate) mod tests {
             setup_conversation_view(StubAgentServer::new(connection), cx).await;
         add_to_workspace(conversation_view.clone(), cx);
 
-        let editor_focus_handle =
-            message_editor(&conversation_view, cx).read_with(cx, |editor, cx| {
-                editor.focus_handle(cx)
-            });
+        let editor_focus_handle = message_editor(&conversation_view, cx)
+            .read_with(cx, |editor, cx| editor.focus_handle(cx));
         cx.update(|window, cx| {
             window.focus(&editor_focus_handle, cx);
         });
