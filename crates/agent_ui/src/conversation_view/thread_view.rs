@@ -552,8 +552,12 @@ enum PermissionTextPromptMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PermissionTextPrompt {
     mode: PermissionTextPromptMode,
+    label: Option<String>,
     placeholder: Option<String>,
     initial_value: String,
+    language: Option<String>,
+    required: bool,
+    secret: bool,
 }
 
 impl PermissionTextPrompt {
@@ -563,6 +567,12 @@ impl PermissionTextPrompt {
             Some("editor" | "multi_line" | "multiline") => PermissionTextPromptMode::MultiLine,
             _ => PermissionTextPromptMode::SingleLine,
         };
+        let string_field = |name: &str| {
+            prompt
+                .get(name)
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned)
+        };
         let placeholder = prompt
             .get("placeholder")
             .and_then(|value| value.as_str())
@@ -570,6 +580,8 @@ impl PermissionTextPrompt {
         let initial_value = prompt
             .get("initialValue")
             .or_else(|| prompt.get("initial_value"))
+            .or_else(|| prompt.get("defaultValue"))
+            .or_else(|| prompt.get("default_value"))
             .or_else(|| prompt.get("prefill"))
             .or_else(|| prompt.get("value"))
             .and_then(|value| value.as_str())
@@ -578,13 +590,27 @@ impl PermissionTextPrompt {
 
         Some(Self {
             mode,
+            label: string_field("label"),
             placeholder,
             initial_value,
+            language: string_field("language"),
+            required: prompt
+                .get("required")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+            secret: prompt
+                .get("secret")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
         })
     }
 
     fn is_multiline(&self) -> bool {
         self.mode == PermissionTextPromptMode::MultiLine
+    }
+
+    fn placeholder_text(&self) -> Option<&str> {
+        self.placeholder.as_deref().or(self.label.as_deref())
     }
 }
 
@@ -598,16 +624,24 @@ mod permission_text_prompt_tests {
             TEXT_PROMPT_META_KEY.into(),
             serde_json::json!({
                 "mode": "input",
+                "label": "Branch",
                 "placeholder": "Branch name",
-                "initialValue": "feature/foo"
+                "initialValue": "feature/foo",
+                "language": "text",
+                "required": true
             }),
         )]);
 
         let prompt = PermissionTextPrompt::from_meta(Some(&meta)).unwrap();
 
         assert_eq!(prompt.mode, PermissionTextPromptMode::SingleLine);
+        assert_eq!(prompt.label.as_deref(), Some("Branch"));
         assert_eq!(prompt.placeholder.as_deref(), Some("Branch name"));
+        assert_eq!(prompt.placeholder_text(), Some("Branch name"));
         assert_eq!(prompt.initial_value, "feature/foo");
+        assert_eq!(prompt.language.as_deref(), Some("text"));
+        assert!(prompt.required);
+        assert!(!prompt.secret);
     }
 
     #[test]
@@ -624,6 +658,27 @@ mod permission_text_prompt_tests {
 
         assert_eq!(prompt.mode, PermissionTextPromptMode::MultiLine);
         assert_eq!(prompt.initial_value, "line one\nline two");
+    }
+
+    #[test]
+    fn parses_label_fallback_secret_and_default_aliases() {
+        let meta = acp::Meta::from_iter([(
+            TEXT_PROMPT_META_KEY.into(),
+            serde_json::json!({
+                "mode": "input",
+                "label": "API token",
+                "default_value": "token-default",
+                "secret": true
+            }),
+        )]);
+
+        let prompt = PermissionTextPrompt::from_meta(Some(&meta)).unwrap();
+
+        assert_eq!(prompt.mode, PermissionTextPromptMode::SingleLine);
+        assert_eq!(prompt.placeholder.as_deref(), None);
+        assert_eq!(prompt.placeholder_text(), Some("API token"));
+        assert_eq!(prompt.initial_value, "token-default");
+        assert!(prompt.secret);
     }
 }
 
@@ -7640,9 +7695,10 @@ impl ThreadView {
             } else {
                 Editor::single_line(window, cx)
             };
-            if let Some(placeholder) = &prompt.placeholder {
+            if let Some(placeholder) = prompt.placeholder_text() {
                 editor.set_placeholder_text(placeholder, window, cx);
             }
+            editor.set_masked(prompt.secret, cx);
             editor.set_text(prompt.initial_value, window, cx);
             editor
         });
