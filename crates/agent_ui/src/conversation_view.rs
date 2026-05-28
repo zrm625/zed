@@ -5620,6 +5620,67 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_external_status_surfaces_render_native_activity_summary(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        let active = active_thread(&conversation_view, cx);
+        let thread = cx.read(|cx| active.read(cx).thread.clone());
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("Pi status [circle]: ready".into()).meta(
+                            acp::Meta::from_iter([(
+                                acp_thread::STATUS_SURFACE_META_KEY.into(),
+                                json!({
+                                    "kind": "persistent_status",
+                                    "key": "circle",
+                                    "text": "ready",
+                                    "lines": ["healthy"]
+                                }),
+                            )]),
+                        ),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("Pi notify: hello".into()).meta(
+                            acp::Meta::from_iter([(
+                                acp_thread::STATUS_SURFACE_META_KEY.into(),
+                                json!({
+                                    "kind": "transient",
+                                    "key": "notice",
+                                    "text": "hello"
+                                }),
+                            )]),
+                        ),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        active.update_in(cx, |view, window, cx| {
+            let summaries = view.external_status_surface_summaries(cx);
+            assert_eq!(summaries.len(), 1, "transient notifications should not persist in the native status summary");
+            assert_eq!(summaries[0].label.as_ref(), "circle");
+            assert_eq!(summaries[0].value.as_ref(), "ready");
+            assert_eq!(summaries[0].details[0].as_ref(), "healthy");
+            assert!(
+                view.render_activity_bar(window, cx).is_some(),
+                "external status surfaces should render a native activity summary even without plan/edit/queue items",
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_rewind_views(cx: &mut TestAppContext) {
         init_test(cx);
 
