@@ -3401,6 +3401,7 @@ pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::Arc;
+    use util::rel_path::rel_path;
     use workspace::{Item, MultiWorkspace};
 
     use crate::agent_panel;
@@ -4235,6 +4236,96 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_tool_call_location_action_opens_target_file(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            util::path!("/project"),
+            json!({
+                "src": {
+                    "main.rs": "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\n"
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs, [Path::new(util::path!("/project"))], cx).await;
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new("location-click", "Edit `src/main.rs`")
+                .kind(acp::ToolKind::Edit)
+                .status(acp::ToolCallStatus::Completed)
+                .locations(vec![
+                    acp::ToolCallLocation::new("src/main.rs").line(Some(7)),
+                ]),
+        )]);
+
+        let (conversation_view, cx) = setup_conversation_view_for_project(
+            StubAgentServer::new(connection),
+            project,
+            None,
+            cx,
+        );
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("edit the target", window, cx);
+        });
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert!(
+                view.thread
+                    .read(cx)
+                    .entries()
+                    .get(1)
+                    .and_then(|entry| entry.location(0))
+                    .is_some(),
+                "expected ACP tool-call location to resolve before opening"
+            );
+        });
+
+        let location_bounds = cx
+            .debug_bounds("open-tool-call-location-1")
+            .expect("expected tool-call location row to render");
+        assert!(location_bounds.size.width > px(0.));
+        assert!(location_bounds.size.height > px(0.));
+
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.open_tool_call_location(1, 0, window, cx);
+        });
+        cx.run_until_parked();
+        cx.run_until_parked();
+
+        let workspace = conversation_view.read_with(cx, |view, _| view.workspace.clone());
+        let active_editor = workspace
+            .read_with(cx, |workspace, cx| workspace.active_item_as::<Editor>(cx))
+            .expect("expected workspace to remain open")
+            .expect("expected location action to open an editor");
+
+        active_editor.update(cx, |editor, cx| {
+            assert_eq!(
+                editor
+                    .active_project_path(cx)
+                    .as_ref()
+                    .map(|path| path.path.as_ref()),
+                Some(rel_path("src/main.rs"))
+            );
+
+            let cursor = editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head();
+            assert_eq!(cursor.row, 7);
+        });
+    }
+
+    #[gpui::test]
     async fn test_notification_for_tool_authorization(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -4968,6 +5059,15 @@ pub(crate) mod tests {
     ) -> (Entity<ConversationView>, &mut VisualTestContext) {
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
+        setup_conversation_view_for_project(agent, project, initial_content, cx)
+    }
+
+    fn setup_conversation_view_for_project(
+        agent: impl AgentServer + 'static,
+        project: Entity<Project>,
+        initial_content: Option<AgentInitialContent>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ConversationView>, &mut VisualTestContext) {
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());

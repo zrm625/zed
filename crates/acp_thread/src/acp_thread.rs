@@ -474,7 +474,7 @@ impl ToolCall {
         let buffer = project
             .update(cx, |project, cx| {
                 project
-                    .project_path_for_absolute_path(&location.path, cx)
+                    .find_project_path(&location.path, cx)
                     .map(|path| project.open_buffer(path, cx))
             })
             .ok()??;
