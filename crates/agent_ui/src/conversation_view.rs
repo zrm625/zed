@@ -407,11 +407,15 @@ impl Conversation {
         tool_call_id: acp::ToolCallId,
         selection: Option<&thread_view::PermissionSelection>,
         is_allow: bool,
+        extra_meta: Option<acp::Meta>,
         cx: &mut Context<Self>,
     ) -> Option<()> {
         let options =
             self.permission_options_for_tool_call(&session_id, tool_call_id.clone(), cx)?;
-        let outcome = resolve_outcome_from_selection(options, selection, is_allow)?;
+        let outcome = merge_outcome_meta(
+            resolve_outcome_from_selection(options, selection, is_allow)?,
+            extra_meta,
+        );
         self.authorize_tool_call(session_id, tool_call_id, outcome, cx);
         Some(())
     }
@@ -470,11 +474,10 @@ fn resolve_outcome_from_selection(
                 acp::PermissionOptionKind::RejectOnce
             };
             let option = options.first_option_of_kind(kind)?;
-            return Some(SelectedPermissionOutcome::new(
-                option.option_id.clone(),
-                option.kind,
-            )
-            .meta(option.meta.clone()));
+            return Some(
+                SelectedPermissionOutcome::new(option.option_id.clone(), option.kind)
+                    .meta(option.meta.clone()),
+            );
         }
     };
 
@@ -491,6 +494,19 @@ fn resolve_outcome_from_selection(
         .unwrap_or_else(|| choices.len().saturating_sub(1));
     let selected_choice = choices.get(selected_index).or(choices.last())?;
     Some(selected_choice.build_outcome(is_allow))
+}
+
+fn merge_outcome_meta(
+    mut outcome: SelectedPermissionOutcome,
+    extra_meta: Option<acp::Meta>,
+) -> SelectedPermissionOutcome {
+    let Some(extra_meta) = extra_meta else {
+        return outcome;
+    };
+    let mut meta = outcome.meta.take().unwrap_or_default();
+    meta.extend(extra_meta);
+    outcome.meta = Some(meta);
+    outcome
 }
 
 fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
@@ -1549,7 +1565,12 @@ impl ConversationView {
             AcpThreadEvent::SubagentSpawned(subagent_session_id) => {
                 self.load_subagent_session(subagent_session_id.clone(), session_id, window, cx)
             }
-            AcpThreadEvent::ToolAuthorizationRequested(_) => {
+            AcpThreadEvent::ToolAuthorizationRequested(id) => {
+                if let Some(active) = self.thread_view(&session_id) {
+                    active.update(cx, |active, cx| {
+                        active.sync_permission_text_prompt_editor(id, window, cx);
+                    });
+                }
                 self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
             }
             AcpThreadEvent::ToolAuthorizationReceived(_) => {}
@@ -7602,6 +7623,34 @@ pub(crate) mod tests {
                 .and_then(|value| value.as_str()),
             Some("typed value"),
             "flat permission option _meta should round-trip into ACP selected outcome _meta"
+        );
+    }
+
+    #[test]
+    fn merge_outcome_meta_preserves_existing_entries() {
+        let outcome = SelectedPermissionOutcome::new(
+            acp::PermissionOptionId::new("submit"),
+            acp::PermissionOptionKind::AllowOnce,
+        )
+        .meta(Some(acp::Meta::from_iter([(
+            "existing".into(),
+            "kept".into(),
+        )])));
+
+        let outcome = super::merge_outcome_meta(
+            outcome,
+            Some(acp::Meta::from_iter([("value".into(), "typed".into())])),
+        );
+        let acp_outcome = acp::SelectedPermissionOutcome::from(outcome);
+        let meta = acp_outcome.meta.as_ref().unwrap();
+
+        assert_eq!(
+            meta.get("existing").and_then(|value| value.as_str()),
+            Some("kept")
+        );
+        assert_eq!(
+            meta.get("value").and_then(|value| value.as_str()),
+            Some("typed")
         );
     }
 
