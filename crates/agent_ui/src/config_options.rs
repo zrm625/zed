@@ -984,6 +984,57 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn custom_category_config_option_cycles_through_generic_selector(cx: &mut TestAppContext) {
+        let agent_server = Rc::new(TestAgentServer::default());
+        let config_options = Rc::new(TestSessionConfigOptions::new(vec![
+            acp::SessionConfigOption::select(
+                "auto_compaction",
+                "Compaction",
+                "enabled",
+                vec![
+                    acp::SessionConfigSelectOption::new("enabled", "Auto compaction on"),
+                    acp::SessionConfigSelectOption::new("disabled", "Auto compaction off"),
+                ],
+            )
+            .category(acp::SessionConfigOptionCategory::Other(
+                "_compaction".to_string(),
+            )),
+        ]));
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            let config_options: Rc<dyn AgentSessionConfigOptions> = config_options.clone();
+            let agent_server: Rc<dyn AgentServer> = agent_server.clone();
+            let fs = fs.clone();
+            let view = cx.new(|_| ConfigOptionsView {
+                config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
+                config_options,
+                selectors: Vec::new(),
+                agent_server,
+                fs,
+                _refresh_task: Task::ready(()),
+            });
+
+            assert!(view.update(cx, |view, cx| {
+                view.cycle_category_option(
+                    acp::SessionConfigOptionCategory::Other("_compaction".to_string()),
+                    false,
+                    cx,
+                )
+            }));
+        });
+
+        assert_eq!(
+            agent_server.saved_defaults.lock().as_slice(),
+            &[("auto_compaction".to_string(), Some("disabled".to_string()))]
+        );
+        assert_eq!(
+            config_options.set_values.borrow().as_slice(),
+            &[("auto_compaction".to_string(), "disabled".to_string())]
+        );
+    }
+
     #[derive(Default)]
     struct TestAgentServer {
         saved_defaults: Arc<Mutex<Vec<(String, Option<String>)>>>,
