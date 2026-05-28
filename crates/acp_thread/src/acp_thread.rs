@@ -138,7 +138,8 @@ impl ExternalStatusSurface {
     }
 
     fn storage_key(&self) -> String {
-        self.key.as_ref().unwrap_or(&self.kind).as_ref().to_owned()
+        let key = self.key.as_ref().unwrap_or(&self.kind);
+        format!("{}:{}", self.kind.as_ref(), key.as_ref())
     }
 }
 
@@ -3839,7 +3840,7 @@ mod tests {
         thread.read_with(cx, |thread, cx| {
             let surface = thread
                 .external_status_surfaces()
-                .get("circle")
+                .get("persistent_status:circle")
                 .expect("status surface metadata should be preserved");
             assert_eq!(surface.kind.as_ref(), "persistent_status");
             assert_eq!(surface.key.as_ref().map(AsRef::as_ref), Some("circle"));
@@ -3854,6 +3855,10 @@ mod tests {
             );
             assert_eq!(surface.progress.as_ref().map(AsRef::as_ref), Some("45"));
             assert_eq!(surface.lines.len(), 2);
+            assert!(
+                !thread.external_status_surfaces().contains_key("circle"),
+                "surface storage should include kind to avoid status/widget key collisions"
+            );
             assert!(
                 thread.to_markdown(cx).contains("Pi status [circle]: ready"),
                 "status transcript fallback should remain visible"
@@ -3914,13 +3919,107 @@ mod tests {
 
         thread.read_with(cx, |thread, cx| {
             assert!(
-                !thread.external_status_surfaces().contains_key("circle"),
+                !thread
+                    .external_status_surfaces()
+                    .contains_key("persistent_status:circle"),
                 "clear metadata should remove the native status surface"
             );
             let markdown = thread.to_markdown(cx);
             assert!(
                 markdown.matches("Pi status [circle]: ready").count() == 1,
                 "metadata-only clears should not append additional transcript text"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_status_surface_storage_keys_include_kind(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            for (kind, text) in [
+                ("persistent_status", "ready"),
+                ("persistent_widget", "visible"),
+            ] {
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::AgentMessageChunk(
+                            acp::ContentChunk::new(format!("Pi {kind} [circle]: {text}").into())
+                                .meta(acp::Meta::from_iter([(
+                                    STATUS_SURFACE_META_KEY.into(),
+                                    json!({
+                                        "kind": kind,
+                                        "key": "circle",
+                                        "text": text
+                                    }),
+                                )])),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            }
+        });
+
+        thread.read_with(cx, |thread, _cx| {
+            let surfaces = thread.external_status_surfaces();
+            assert_eq!(
+                surfaces.len(),
+                2,
+                "status and widget surfaces with the same key should not overwrite each other"
+            );
+            assert_eq!(
+                surfaces
+                    .get("persistent_status:circle")
+                    .and_then(|surface| surface.text.as_ref())
+                    .map(AsRef::as_ref),
+                Some("ready")
+            );
+            assert_eq!(
+                surfaces
+                    .get("persistent_widget:circle")
+                    .and_then(|surface| surface.text.as_ref())
+                    .map(AsRef::as_ref),
+                Some("visible")
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("".into()).meta(
+                        acp::Meta::from_iter([(
+                            STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "persistent_status",
+                                "key": "circle",
+                                "clear": true
+                            }),
+                        )]),
+                    )),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _cx| {
+            let surfaces = thread.external_status_surfaces();
+            assert!(
+                !surfaces.contains_key("persistent_status:circle"),
+                "clearing a status surface should remove only the matching kind/key"
+            );
+            assert!(
+                surfaces.contains_key("persistent_widget:circle"),
+                "clearing a status surface should not clear a widget with the same key"
             );
         });
     }
