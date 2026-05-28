@@ -3381,7 +3381,7 @@ fn plan_label_markdown_style(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use acp_thread::StubAgentConnection;
+    use acp_thread::{AgentSessionConfigOptions, StubAgentConnection};
     use action_log::ActionLog;
     use agent::{AgentTool, EditFileTool, FetchTool, TerminalTool, ToolPermissionContext};
     use agent_servers::FakeAcpAgentServer;
@@ -3466,6 +3466,49 @@ pub(crate) mod tests {
             assert_eq!(view.message_editor.read(cx).text(cx), "");
             assert_eq!(view.thread.read(cx).entries().len(), 2);
         });
+    }
+
+    #[gpui::test]
+    async fn test_cycle_thinking_effort_action_uses_acp_thought_level_config_option(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = ConfigOptionsAgentConnection::new(vec![
+            acp::SessionConfigOption::select(
+                "thinking_level",
+                "Thinking",
+                "medium",
+                vec![
+                    acp::SessionConfigSelectOption::new("medium", "Medium"),
+                    acp::SessionConfigSelectOption::new("high", "High"),
+                ],
+            )
+            .category(acp::SessionConfigOptionCategory::ThoughtLevel),
+        ]);
+        let set_values = connection.set_values.clone();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let editor_focus_handle =
+            message_editor(&conversation_view, cx).read_with(cx, |editor, cx| {
+                editor.focus_handle(cx)
+            });
+        cx.update(|window, cx| {
+            window.focus(&editor_focus_handle, cx);
+        });
+
+        message_editor(&conversation_view, cx).update_in(cx, |_, window, cx| {
+            window.dispatch_action(CycleThinkingEffort.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            set_values.lock().as_slice(),
+            &[("thinking_level".to_string(), "high".to_string())],
+            "CycleThinkingEffort should route through ACP ThoughtLevel config options even from editor focus"
+        );
     }
 
     #[gpui::test]
@@ -5307,6 +5350,119 @@ pub(crate) mod tests {
                 cx,
             )
         })
+    }
+
+    #[derive(Clone)]
+    struct ConfigOptionsAgentConnection {
+        options: Arc<Mutex<Vec<acp::SessionConfigOption>>>,
+        set_values: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl ConfigOptionsAgentConnection {
+        fn new(options: Vec<acp::SessionConfigOption>) -> Self {
+            Self {
+                options: Arc::new(Mutex::new(options)),
+                set_values: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl AgentConnection for ConfigOptionsAgentConnection {
+        fn agent_id(&self) -> AgentId {
+            AgentId::new("config-options")
+        }
+
+        fn telemetry_id(&self) -> SharedString {
+            "config-options".into()
+        }
+
+        fn new_session(
+            self: Rc<Self>,
+            project: Entity<Project>,
+            _work_dirs: PathList,
+            cx: &mut App,
+        ) -> Task<gpui::Result<Entity<AcpThread>>> {
+            let connection: Rc<dyn AgentConnection> = self;
+            Task::ready(Ok(build_test_thread(
+                connection,
+                project,
+                "ConfigOptionsAgentConnection",
+                acp::SessionId::new("config-options-session"),
+                cx,
+            )))
+        }
+
+        fn auth_methods(&self) -> &[acp::AuthMethod] {
+            &[]
+        }
+
+        fn authenticate(
+            &self,
+            _method_id: acp::AuthMethodId,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn prompt(
+            &self,
+            _id: acp_thread::UserMessageId,
+            _params: acp::PromptRequest,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<acp::PromptResponse>> {
+            Task::ready(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)))
+        }
+
+        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {}
+
+        fn session_config_options(
+            &self,
+            _session_id: &acp::SessionId,
+            _cx: &App,
+        ) -> Option<Rc<dyn AgentSessionConfigOptions>> {
+            Some(Rc::new(TestAgentSessionConfigOptions {
+                options: self.options.clone(),
+                set_values: self.set_values.clone(),
+            }))
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    struct TestAgentSessionConfigOptions {
+        options: Arc<Mutex<Vec<acp::SessionConfigOption>>>,
+        set_values: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl AgentSessionConfigOptions for TestAgentSessionConfigOptions {
+        fn config_options(&self) -> Vec<acp::SessionConfigOption> {
+            self.options.lock().clone()
+        }
+
+        fn set_config_option(
+            &self,
+            config_id: acp::SessionConfigId,
+            value: acp::SessionConfigValueId,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<Vec<acp::SessionConfigOption>>> {
+            self.set_values
+                .lock()
+                .push((config_id.0.to_string(), value.0.to_string()));
+
+            let options = {
+                let mut options = self.options.lock();
+                if let Some(option) = options.iter_mut().find(|option| option.id == config_id)
+                    && let acp::SessionConfigKind::Select(select) = &mut option.kind
+                {
+                    select.current_value = value;
+                }
+                options.clone()
+            };
+
+            Task::ready(Ok(options))
+        }
     }
 
     #[derive(Clone)]
