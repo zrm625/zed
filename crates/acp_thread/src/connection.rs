@@ -510,7 +510,9 @@ impl PermissionOptionChoice {
             None
         };
 
-        crate::SelectedPermissionOutcome::new(option.option_id.clone(), option.kind).params(params)
+        crate::SelectedPermissionOutcome::new(option.option_id.clone(), option.kind)
+            .params(params)
+            .meta(option.meta.clone())
     }
 }
 
@@ -631,7 +633,8 @@ impl PermissionOptions {
         let outcome = crate::SelectedPermissionOutcome::new(option.option_id.clone(), option.kind)
             .params(Some(crate::SelectedPermissionParams::Terminal {
                 patterns: checked_patterns,
-            }));
+            }))
+            .meta(option.meta.clone());
         Some(outcome)
     }
 }
