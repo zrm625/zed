@@ -652,6 +652,9 @@ enum ToolCallLayout {
     Embedded,
 }
 
+const EXTERNAL_STATUS_SURFACE_SUMMARY_TEXT_LIMIT: usize = 160;
+const EXTERNAL_STATUS_SURFACE_SUMMARY_DETAIL_LIMIT: usize = 4;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExternalStatusSurfaceSummary {
     pub kind: SharedString,
@@ -679,14 +682,16 @@ fn external_status_surface_summary(
     {
         values.push(placement.clone());
     }
-    let value = values.first().cloned()?;
+    let raw_value = values.first().cloned()?;
+    let value = bounded_external_status_surface_text(raw_value.clone());
     let mut details = values.into_iter().skip(1).collect::<Vec<_>>();
     if !matches!(surface.kind.as_ref(), "status" | "persistent_status")
         && let Some(placement) = surface.placement.as_ref()
-        && value != *placement
+        && raw_value != *placement
     {
         details.insert(0, format!("Placement: {}", placement.as_ref()).into());
     }
+    let details = bounded_external_status_surface_details(details);
 
     Some(ExternalStatusSurfaceSummary {
         kind: surface.kind.clone(),
@@ -694,6 +699,35 @@ fn external_status_surface_summary(
         value,
         details,
     })
+}
+
+fn bounded_external_status_surface_text(text: SharedString) -> SharedString {
+    if text.as_ref().chars().count() <= EXTERNAL_STATUS_SURFACE_SUMMARY_TEXT_LIMIT {
+        return text;
+    }
+
+    let mut truncated = text
+        .as_ref()
+        .chars()
+        .take(EXTERNAL_STATUS_SURFACE_SUMMARY_TEXT_LIMIT.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated.into()
+}
+
+fn bounded_external_status_surface_details(details: Vec<SharedString>) -> Vec<SharedString> {
+    let omitted_count = details
+        .len()
+        .saturating_sub(EXTERNAL_STATUS_SURFACE_SUMMARY_DETAIL_LIMIT);
+    let mut bounded = details
+        .into_iter()
+        .take(EXTERNAL_STATUS_SURFACE_SUMMARY_DETAIL_LIMIT)
+        .map(bounded_external_status_surface_text)
+        .collect::<Vec<_>>();
+    if omitted_count > 0 {
+        bounded.push(format!("+{} more", omitted_count).into());
+    }
+    bounded
 }
 
 fn editor_text_content(surface: &ExternalStatusSurface) -> Option<Vec<acp::ContentBlock>> {
