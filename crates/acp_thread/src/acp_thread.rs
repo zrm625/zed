@@ -3307,6 +3307,59 @@ mod tests {
         });
     }
 
+    #[test]
+    fn selected_permission_outcome_preserves_acp_meta() {
+        let outcome = SelectedPermissionOutcome::new(
+            acp::PermissionOptionId::new("submit"),
+            acp::PermissionOptionKind::AllowOnce,
+        )
+        .meta(Some(acp::Meta::from_iter([(
+            "value".into(),
+            "typed text".into(),
+        )])));
+
+        let acp_outcome = acp::SelectedPermissionOutcome::from(outcome);
+
+        assert_eq!(acp_outcome.option_id.0.as_ref(), "submit");
+        assert_eq!(
+            acp_outcome
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("value"))
+                .and_then(|value| value.as_str()),
+            Some("typed text")
+        );
+    }
+
+    #[test]
+    fn selected_permission_outcome_merges_terminal_params_into_meta() {
+        let outcome = SelectedPermissionOutcome::new(
+            acp::PermissionOptionId::new("allow"),
+            acp::PermissionOptionKind::AllowAlways,
+        )
+        .meta(Some(acp::Meta::from_iter([(
+            "existing".into(),
+            "kept".into(),
+        )])))
+        .params(Some(SelectedPermissionParams::Terminal {
+            patterns: vec!["npm test".to_string(), "cargo test".to_string()],
+        }));
+
+        let acp_outcome = acp::SelectedPermissionOutcome::from(outcome);
+        let meta = acp_outcome.meta.as_ref().unwrap();
+
+        assert_eq!(
+            meta.get("existing").and_then(|value| value.as_str()),
+            Some("kept")
+        );
+        assert_eq!(
+            meta.get(TERMINAL_PERMISSION_PATTERNS_META_KEY)
+                .and_then(|value| value.as_array())
+                .map(|patterns| patterns.len()),
+            Some(2)
+        );
+    }
+
     #[gpui::test]
     async fn test_terminal_output_buffered_before_created_renders(cx: &mut gpui::TestAppContext) {
         init_test(cx);
