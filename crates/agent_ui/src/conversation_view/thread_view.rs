@@ -2373,6 +2373,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.clear_permission_text_prompt_editor(&tool_call_id);
         self.conversation.update(cx, |conversation, cx| {
             conversation.authorize_tool_call(session_id, tool_call_id, outcome, cx);
         });
@@ -2405,9 +2406,22 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) -> Option<()> {
         let session_id = self.thread.read(cx).session_id().clone();
+        let (_, tool_call_id, _) = self
+            .conversation
+            .read(cx)
+            .pending_tool_call(&session_id, cx)?;
+        let extra_meta = self.permission_text_prompt_value_meta(
+            &tool_call_id,
+            matches!(
+                kind,
+                acp::PermissionOptionKind::AllowOnce | acp::PermissionOptionKind::AllowAlways
+            ),
+            cx,
+        );
         self.conversation.update(cx, |conversation, cx| {
-            conversation.authorize_pending_tool_call(&session_id, kind, cx)
+            conversation.authorize_pending_tool_call(&session_id, kind, extra_meta, cx)
         })?;
+        self.clear_permission_text_prompt_editor(&tool_call_id);
         if self.should_be_following {
             self.workspace
                 .update(cx, |workspace, cx| {
@@ -2544,10 +2558,11 @@ impl ThreadView {
     ) -> Option<()> {
         let selection = self.permission_selections.get(&tool_call_id).cloned();
         let extra_meta = self.permission_text_prompt_value_meta(&tool_call_id, is_allow, cx);
+        let tool_call_id_for_auth = tool_call_id.clone();
         let result = self.conversation.update(cx, |conversation, cx| {
             conversation.authorize_with_granularity(
                 session_id,
-                tool_call_id,
+                tool_call_id_for_auth,
                 selection.as_ref(),
                 is_allow,
                 extra_meta,
@@ -2561,8 +2576,17 @@ impl ThreadView {
                 })
                 .ok();
         }
+        if result.is_some() {
+            self.clear_permission_text_prompt_editor(&tool_call_id);
+        }
         cx.notify();
         result
+    }
+
+    pub(crate) fn clear_permission_text_prompt_editor(&mut self, tool_call_id: &acp::ToolCallId) {
+        self.permission_text_editors
+            .borrow_mut()
+            .remove(tool_call_id);
     }
 
     fn permission_text_prompt_value_meta(

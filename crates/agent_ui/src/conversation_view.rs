@@ -387,17 +387,18 @@ impl Conversation {
         &mut self,
         session_id: &acp::SessionId,
         kind: acp::PermissionOptionKind,
+        extra_meta: Option<acp::Meta>,
         cx: &mut Context<Self>,
     ) -> Option<()> {
         let (authorize_session_id, tool_call_id, options) =
             self.pending_tool_call(session_id, cx)?;
         let option = options.first_option_of_kind(kind)?;
-        self.authorize_tool_call(
-            authorize_session_id,
-            tool_call_id,
-            SelectedPermissionOutcome::new(option.option_id.clone(), option.kind),
-            cx,
+        let outcome = merge_outcome_meta(
+            SelectedPermissionOutcome::new(option.option_id.clone(), option.kind)
+                .meta(option.meta.clone()),
+            extra_meta,
         );
+        self.authorize_tool_call(authorize_session_id, tool_call_id, outcome, cx);
         Some(())
     }
 
@@ -1569,7 +1570,13 @@ impl ConversationView {
                 }
                 self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
             }
-            AcpThreadEvent::ToolAuthorizationReceived(_) => {}
+            AcpThreadEvent::ToolAuthorizationReceived(id) => {
+                if let Some(active) = self.thread_view(&session_id) {
+                    active.update(cx, |active, _cx| {
+                        active.clear_permission_text_prompt_editor(id);
+                    });
+                }
+            }
             AcpThreadEvent::Retry(retry) => {
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, _cx| {
