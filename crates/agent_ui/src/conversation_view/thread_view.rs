@@ -7889,14 +7889,17 @@ impl ThreadView {
                     .label_size(LabelSize::Small)
                     .on_click(cx.listener({
                         let tool_call_id = tool_call_id.clone();
-                        let option_id = option.option_id.clone();
-                        let option_kind = option.kind;
+                        let option = option.clone();
                         let session_id = session_id.clone();
                         move |this, _, window, cx| {
                             this.authorize_tool_call(
                                 session_id.clone(),
                                 tool_call_id.clone(),
-                                SelectedPermissionOutcome::new(option_id.clone(), option_kind),
+                                SelectedPermissionOutcome::new(
+                                    option.option_id.clone(),
+                                    option.kind,
+                                )
+                                .meta(option.meta.clone()),
                                 window,
                                 cx,
                             );

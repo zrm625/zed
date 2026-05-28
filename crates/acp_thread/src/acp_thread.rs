@@ -533,11 +533,14 @@ pub enum SelectedPermissionParams {
     Terminal { patterns: Vec<String> },
 }
 
+const TERMINAL_PERMISSION_PATTERNS_META_KEY: &str = "zed_terminal_patterns";
+
 #[derive(Debug)]
 pub struct SelectedPermissionOutcome {
     pub option_id: acp::PermissionOptionId,
     pub option_kind: acp::PermissionOptionKind,
     pub params: Option<SelectedPermissionParams>,
+    pub meta: Option<acp::Meta>,
 }
 
 impl SelectedPermissionOutcome {
@@ -546,6 +549,7 @@ impl SelectedPermissionOutcome {
             option_id,
             option_kind,
             params: None,
+            meta: None,
         }
     }
 
@@ -553,12 +557,31 @@ impl SelectedPermissionOutcome {
         self.params = params;
         self
     }
+
+    pub fn meta(mut self, meta: Option<acp::Meta>) -> Self {
+        self.meta = meta;
+        self
+    }
 }
 
 impl From<SelectedPermissionOutcome> for acp::SelectedPermissionOutcome {
     fn from(value: SelectedPermissionOutcome) -> Self {
-        Self::new(value.option_id)
+        Self::new(value.option_id).meta(selected_permission_outcome_meta(value.meta, value.params))
     }
+}
+
+fn selected_permission_outcome_meta(
+    meta: Option<acp::Meta>,
+    params: Option<SelectedPermissionParams>,
+) -> Option<acp::Meta> {
+    let mut meta = meta.unwrap_or_default();
+    match params {
+        Some(SelectedPermissionParams::Terminal { patterns }) if !patterns.is_empty() => {
+            meta.insert(TERMINAL_PERMISSION_PATTERNS_META_KEY.into(), patterns.into());
+        }
+        _ => {}
+    }
+    (!meta.is_empty()).then_some(meta)
 }
 
 #[derive(Debug)]

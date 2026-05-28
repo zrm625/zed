@@ -473,7 +473,8 @@ fn resolve_outcome_from_selection(
             return Some(SelectedPermissionOutcome::new(
                 option.option_id.clone(),
                 option.kind,
-            ));
+            )
+            .meta(option.meta.clone()));
         }
     };
 
@@ -7536,6 +7537,23 @@ pub(crate) mod tests {
         ])
     }
 
+    fn flat_submit_cancel_options_with_value() -> PermissionOptions {
+        let meta = acp::Meta::from_iter([("value".into(), "typed value".into())]);
+        PermissionOptions::Flat(vec![
+            acp::PermissionOption::new(
+                acp::PermissionOptionId::new("submit"),
+                "Submit",
+                acp::PermissionOptionKind::AllowOnce,
+            )
+            .meta(meta),
+            acp::PermissionOption::new(
+                acp::PermissionOptionId::new("cancel"),
+                "Cancel",
+                acp::PermissionOptionKind::RejectOnce,
+            ),
+        ])
+    }
+
     #[test]
     fn resolve_outcome_from_selection_flat_allow_picks_allow_once() {
         let options = flat_allow_deny_options();
@@ -7566,6 +7584,25 @@ pub(crate) mod tests {
             super::resolve_outcome_from_selection(&options, Some(&selection), true).unwrap();
 
         assert_eq!(outcome.option_id.0.as_ref(), "allow");
+    }
+
+    #[test]
+    fn resolve_outcome_from_selection_flat_preserves_option_meta() {
+        let options = flat_submit_cancel_options_with_value();
+
+        let outcome = super::resolve_outcome_from_selection(&options, None, true).unwrap();
+        let acp_outcome = acp::SelectedPermissionOutcome::from(outcome);
+
+        assert_eq!(acp_outcome.option_id.0.as_ref(), "submit");
+        assert_eq!(
+            acp_outcome
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("value"))
+                .and_then(|value| value.as_str()),
+            Some("typed value"),
+            "flat permission option _meta should round-trip into ACP selected outcome _meta"
+        );
     }
 
     #[test]
@@ -7655,6 +7692,16 @@ pub(crate) mod tests {
         assert!(
             outcome.params.is_some(),
             "checked patterns should attach terminal params"
+        );
+        let acp_outcome = acp::SelectedPermissionOutcome::from(outcome);
+        assert!(
+            acp_outcome
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("zed_terminal_patterns"))
+                .and_then(|value| value.as_array())
+                .is_some_and(|patterns| !patterns.is_empty()),
+            "terminal params should round-trip into ACP selected outcome _meta"
         );
     }
 
