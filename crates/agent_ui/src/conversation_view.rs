@@ -296,6 +296,7 @@ impl Conversation {
                     | AcpThreadEvent::ModeUpdated(_)
                     | AcpThreadEvent::ConfigOptionsUpdated(_)
                     | AcpThreadEvent::WorkingDirectoriesUpdated
+                    | AcpThreadEvent::ExternalStatusSurfaceUpdated
                     | AcpThreadEvent::PromptUpdated => {}
                 }
             }
@@ -513,6 +514,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ModeUpdated(_)
         | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::SubagentSpawned(_)
+        | AcpThreadEvent::ExternalStatusSurfaceUpdated
         | AcpThreadEvent::PromptUpdated => false,
     }
 }
@@ -1761,6 +1763,9 @@ impl ConversationView {
                 cx.notify();
             }
             AcpThreadEvent::WorkingDirectoriesUpdated => {
+                cx.notify();
+            }
+            AcpThreadEvent::ExternalStatusSurfaceUpdated => {
                 cx.notify();
             }
             AcpThreadEvent::PromptUpdated => {

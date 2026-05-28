@@ -25,7 +25,7 @@ use project::{
     git_store::{GitStoreCheckpoint, GitStoreEvent, RepositoryEvent},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::to_string_pretty;
+use serde_json::{Value, to_string_pretty};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Formatter, Write};
@@ -58,6 +58,8 @@ impl std::error::Error for MaxOutputTokensError {}
 /// Key used in ACP ToolCall meta to store the tool's programmatic name.
 /// This is a workaround since ACP's ToolCall doesn't have a dedicated name field.
 pub const TOOL_NAME_META_KEY: &str = "tool_name";
+/// Key used in ACP ContentChunk meta to preserve external-agent status/widget state.
+pub const STATUS_SURFACE_META_KEY: &str = "status_surface";
 
 /// Helper to extract tool name from ACP meta
 pub fn tool_name_from_meta(meta: &Option<acp::Meta>) -> Option<SharedString> {
@@ -91,6 +93,51 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp::Meta>) -> Option<Subag
     meta.as_ref()
         .and_then(|m| m.get(SUBAGENT_SESSION_INFO_META_KEY))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalStatusSurface {
+    pub kind: SharedString,
+    pub key: Option<SharedString>,
+    pub text: Option<SharedString>,
+    pub title: Option<SharedString>,
+    pub placement: Option<SharedString>,
+    pub lines: Vec<SharedString>,
+}
+
+impl ExternalStatusSurface {
+    fn from_meta(meta: Option<&acp::Meta>) -> Option<Self> {
+        let surface = meta?.get(STATUS_SURFACE_META_KEY)?.as_object()?;
+        let kind = string_field(surface, "kind").unwrap_or_else(|| "status".into());
+        let lines = surface
+            .get("lines")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|line| line.to_owned().into())
+            .collect();
+
+        Some(Self {
+            kind,
+            key: string_field(surface, "key"),
+            text: string_field(surface, "text"),
+            title: string_field(surface, "title"),
+            placement: string_field(surface, "placement"),
+            lines,
+        })
+    }
+
+    fn storage_key(&self) -> String {
+        self.key.as_ref().unwrap_or(&self.kind).as_ref().to_owned()
+    }
+}
+
+fn string_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<SharedString> {
+    object
+        .get(key)?
+        .as_str()
+        .map(|value| value.to_owned().into())
 }
 
 #[derive(Debug)]
@@ -1122,6 +1169,7 @@ pub struct AcpThread {
     cost: Option<SessionCost>,
     prompt_capabilities: acp::PromptCapabilities,
     available_commands: Vec<acp::AvailableCommand>,
+    external_status_surfaces: HashMap<String, ExternalStatusSurface>,
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
     terminals: HashMap<acp::TerminalId, Entity<Terminal>>,
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
@@ -1187,6 +1235,7 @@ pub enum AcpThreadEvent {
     ModeUpdated(acp::SessionModeId),
     ConfigOptionsUpdated(Vec<acp::SessionConfigOption>),
     WorkingDirectoriesUpdated,
+    ExternalStatusSurfaceUpdated,
 }
 
 impl EventEmitter<AcpThreadEvent> for AcpThread {}
@@ -1331,6 +1380,7 @@ impl AcpThread {
             cost: None,
             prompt_capabilities,
             available_commands: Vec::new(),
+            external_status_surfaces: HashMap::default(),
             _observe_prompt_capabilities: task,
             terminals: HashMap::default(),
             pending_terminal_output: HashMap::default(),
@@ -1352,6 +1402,10 @@ impl AcpThread {
 
     pub fn available_commands(&self) -> &[acp::AvailableCommand] {
         &self.available_commands
+    }
+
+    pub fn external_status_surfaces(&self) -> &HashMap<String, ExternalStatusSurface> {
+        &self.external_status_surfaces
     }
 
     pub fn is_draft_thread(&self) -> bool {
@@ -1551,7 +1605,12 @@ impl AcpThread {
                     self.push_user_content_block(None, content, cx);
                 }
             }
-            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) => {
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, meta, .. }) => {
+                if let Some(surface) = ExternalStatusSurface::from_meta(meta.as_ref()) {
+                    self.external_status_surfaces
+                        .insert(surface.storage_key(), surface);
+                    cx.emit(AcpThreadEvent::ExternalStatusSurfaceUpdated);
+                }
                 self.push_assistant_content_block(content, false, cx);
             }
             acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk { content, .. }) => {
@@ -3705,6 +3764,64 @@ mod tests {
 
             "#}
         );
+    }
+
+    #[gpui::test]
+    async fn test_agent_message_chunk_preserves_external_status_surface(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("Pi status [circle]: ready".into()).meta(
+                            acp::Meta::from_iter([(
+                                STATUS_SURFACE_META_KEY.into(),
+                                json!({
+                                    "kind": "persistent_status",
+                                    "key": "circle",
+                                    "text": "ready",
+                                    "placement": "footer",
+                                    "lines": ["ready", "healthy"]
+                                }),
+                            )]),
+                        ),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            let surface = thread
+                .external_status_surfaces()
+                .get("circle")
+                .expect("status surface metadata should be preserved");
+            assert_eq!(surface.kind.as_ref(), "persistent_status");
+            assert_eq!(surface.key.as_ref().map(AsRef::as_ref), Some("circle"));
+            assert_eq!(surface.text.as_ref().map(AsRef::as_ref), Some("ready"));
+            assert_eq!(
+                surface.placement.as_ref().map(AsRef::as_ref),
+                Some("footer")
+            );
+            assert_eq!(surface.lines.len(), 2);
+            assert!(
+                thread.to_markdown(cx).contains("Pi status [circle]: ready"),
+                "status transcript fallback should remain visible"
+            );
+        });
     }
 
     #[gpui::test]
