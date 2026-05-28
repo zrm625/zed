@@ -296,7 +296,7 @@ impl Conversation {
                     | AcpThreadEvent::ModeUpdated(_)
                     | AcpThreadEvent::ConfigOptionsUpdated(_)
                     | AcpThreadEvent::WorkingDirectoriesUpdated
-                    | AcpThreadEvent::ExternalStatusSurfaceUpdated
+                    | AcpThreadEvent::ExternalStatusSurfaceUpdated(_)
                     | AcpThreadEvent::PromptUpdated => {}
                 }
             }
@@ -514,7 +514,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ModeUpdated(_)
         | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::SubagentSpawned(_)
-        | AcpThreadEvent::ExternalStatusSurfaceUpdated
+        | AcpThreadEvent::ExternalStatusSurfaceUpdated(_)
         | AcpThreadEvent::PromptUpdated => false,
     }
 }
@@ -1765,7 +1765,12 @@ impl ConversationView {
             AcpThreadEvent::WorkingDirectoriesUpdated => {
                 cx.notify();
             }
-            AcpThreadEvent::ExternalStatusSurfaceUpdated => {
+            AcpThreadEvent::ExternalStatusSurfaceUpdated(surface) => {
+                if let Some(active) = self.thread_view(&session_id) {
+                    active.update(cx, |active, cx| {
+                        active.apply_external_status_surface(surface, window, cx);
+                    });
+                }
                 cx.notify();
             }
             AcpThreadEvent::PromptUpdated => {
@@ -5664,8 +5669,29 @@ pub(crate) mod tests {
                     cx,
                 )
                 .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("".into()).meta(
+                        acp::Meta::from_iter([(
+                            acp_thread::STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "editor_text",
+                                "text": "draft from Pi"
+                            }),
+                        )]),
+                    )),
+                    cx,
+                )
+                .unwrap();
         });
         cx.run_until_parked();
+
+        let editor_text =
+            message_editor(&conversation_view, cx).update(cx, |editor, cx| editor.text(cx));
+        assert_eq!(
+            editor_text, "draft from Pi",
+            "editor_text status surfaces should update the native Agent Panel message editor"
+        );
 
         active.update_in(cx, |view, window, cx| {
             let summaries = view.external_status_surface_summaries(cx);
@@ -5695,8 +5721,29 @@ pub(crate) mod tests {
                     cx,
                 )
                 .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("".into()).meta(
+                        acp::Meta::from_iter([(
+                            acp_thread::STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "editor_text",
+                                "clear": true
+                            }),
+                        )]),
+                    )),
+                    cx,
+                )
+                .unwrap();
         });
         cx.run_until_parked();
+
+        let editor_text =
+            message_editor(&conversation_view, cx).update(cx, |editor, cx| editor.text(cx));
+        assert_eq!(
+            editor_text, "",
+            "clear editor_text metadata should clear the native Agent Panel message editor"
+        );
 
         active.update_in(cx, |view, window, cx| {
             assert!(

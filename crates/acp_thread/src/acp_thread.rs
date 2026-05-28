@@ -1244,7 +1244,7 @@ pub enum AcpThreadEvent {
     ModeUpdated(acp::SessionModeId),
     ConfigOptionsUpdated(Vec<acp::SessionConfigOption>),
     WorkingDirectoriesUpdated,
-    ExternalStatusSurfaceUpdated,
+    ExternalStatusSurfaceUpdated(ExternalStatusSurface),
 }
 
 impl EventEmitter<AcpThreadEvent> for AcpThread {}
@@ -1620,9 +1620,9 @@ impl AcpThread {
                         self.external_status_surfaces.remove(&surface.storage_key());
                     } else {
                         self.external_status_surfaces
-                            .insert(surface.storage_key(), surface);
+                            .insert(surface.storage_key(), surface.clone());
                     }
-                    cx.emit(AcpThreadEvent::ExternalStatusSurfaceUpdated);
+                    cx.emit(AcpThreadEvent::ExternalStatusSurfaceUpdated(surface));
                     if content_block_is_empty(&content) {
                         return Ok(());
                     }

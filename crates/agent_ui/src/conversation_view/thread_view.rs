@@ -688,6 +688,20 @@ fn external_status_surface_summary(
     })
 }
 
+fn editor_text_content(surface: &ExternalStatusSurface) -> Option<Vec<acp::ContentBlock>> {
+    if surface.kind.as_ref() != "editor_text" {
+        return None;
+    }
+    if surface.clear {
+        return Some(Vec::new());
+    }
+    surface.text.as_ref().map(|text| {
+        vec![acp::ContentBlock::Text(acp::TextContent::new(
+            text.to_string(),
+        ))]
+    })
+}
+
 fn full_path_for_empty_project_path(file: &dyn language::File, cx: &App) -> Option<String> {
     if file.path().file_name().is_some() {
         return None;
@@ -698,6 +712,21 @@ fn full_path_for_empty_project_path(file: &dyn language::File, cx: &App) -> Opti
 }
 
 impl ThreadView {
+    pub(crate) fn apply_external_status_surface(
+        &mut self,
+        surface: &ExternalStatusSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(content) = editor_text_content(surface) else {
+            return;
+        };
+
+        self.message_editor.update(cx, |editor, cx| {
+            editor.set_message(content, window, cx);
+        });
+    }
+
     pub(crate) fn new(
         root_thread_id: ThreadId,
         thread: Entity<AcpThread>,
@@ -2751,7 +2780,7 @@ impl ThreadView {
             .read(cx)
             .external_status_surfaces()
             .values()
-            .filter(|surface| surface.kind.as_ref() != "transient")
+            .filter(|surface| !matches!(surface.kind.as_ref(), "transient" | "editor_text"))
             .filter_map(external_status_surface_summary)
             .collect::<Vec<_>>();
         summaries.sort_by(|left, right| {
