@@ -103,6 +103,7 @@ pub struct ExternalStatusSurface {
     pub title: Option<SharedString>,
     pub placement: Option<SharedString>,
     pub lines: Vec<SharedString>,
+    pub clear: bool,
 }
 
 impl ExternalStatusSurface {
@@ -125,12 +126,20 @@ impl ExternalStatusSurface {
             title: string_field(surface, "title"),
             placement: string_field(surface, "placement"),
             lines,
+            clear: surface
+                .get("clear")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 
     fn storage_key(&self) -> String {
         self.key.as_ref().unwrap_or(&self.kind).as_ref().to_owned()
     }
+}
+
+fn content_block_is_empty(block: &acp::ContentBlock) -> bool {
+    matches!(block, acp::ContentBlock::Text(text) if text.text.is_empty())
 }
 
 fn string_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<SharedString> {
@@ -1607,9 +1616,16 @@ impl AcpThread {
             }
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, meta, .. }) => {
                 if let Some(surface) = ExternalStatusSurface::from_meta(meta.as_ref()) {
-                    self.external_status_surfaces
-                        .insert(surface.storage_key(), surface);
+                    if surface.clear {
+                        self.external_status_surfaces.remove(&surface.storage_key());
+                    } else {
+                        self.external_status_surfaces
+                            .insert(surface.storage_key(), surface);
+                    }
                     cx.emit(AcpThreadEvent::ExternalStatusSurfaceUpdated);
+                    if content_block_is_empty(&content) {
+                        return Ok(());
+                    }
                 }
                 self.push_assistant_content_block(content, false, cx);
             }
@@ -3820,6 +3836,70 @@ mod tests {
             assert!(
                 thread.to_markdown(cx).contains("Pi status [circle]: ready"),
                 "status transcript fallback should remain visible"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_message_chunk_clears_external_status_surface_without_transcript_noise(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("Pi status [circle]: ready".into()).meta(
+                            acp::Meta::from_iter([(
+                                STATUS_SURFACE_META_KEY.into(),
+                                json!({
+                                    "kind": "persistent_status",
+                                    "key": "circle",
+                                    "text": "ready"
+                                }),
+                            )]),
+                        ),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("".into()).meta(
+                        acp::Meta::from_iter([(
+                            STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "persistent_status",
+                                "key": "circle",
+                                "clear": true
+                            }),
+                        )]),
+                    )),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            assert!(
+                !thread.external_status_surfaces().contains_key("circle"),
+                "clear metadata should remove the native status surface"
+            );
+            let markdown = thread.to_markdown(cx);
+            assert!(
+                markdown.matches("Pi status [circle]: ready").count() == 1,
+                "metadata-only clears should not append additional transcript text"
             );
         });
     }

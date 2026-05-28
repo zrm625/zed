@@ -5678,6 +5678,36 @@ pub(crate) mod tests {
                 "external status surfaces should render a native activity summary even without plan/edit/queue items",
             );
         });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("".into()).meta(
+                        acp::Meta::from_iter([(
+                            acp_thread::STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "persistent_status",
+                                "key": "circle",
+                                "clear": true
+                            }),
+                        )]),
+                    )),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        active.update_in(cx, |view, window, cx| {
+            assert!(
+                view.external_status_surface_summaries(cx).is_empty(),
+                "clear metadata should remove the native status summary entry"
+            );
+            assert!(
+                view.render_activity_bar(window, cx).is_none(),
+                "cleared external status surfaces should not keep the activity bar visible"
+            );
+        });
     }
 
     #[gpui::test]
