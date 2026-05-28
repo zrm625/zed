@@ -540,7 +540,7 @@ impl PermissionSelection {
     }
 }
 
-const TEXT_PROMPT_META_KEY: &str = "zed_text_prompt";
+const TEXT_PROMPT_META_KEY: &str = "text_prompt";
 const TEXT_PROMPT_VALUE_META_KEY: &str = "value";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
