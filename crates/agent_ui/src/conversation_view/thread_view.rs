@@ -8307,7 +8307,6 @@ impl ThreadView {
             .child(tool_icon)
             .child(if has_location {
                 h_flex()
-                    .id(("open-tool-call-location", entry_ix))
                     .w_full()
                     .map(|this| {
                         if use_card_layout {
@@ -8327,10 +8326,6 @@ impl ThreadView {
                             cx,
                         ),
                     )
-                    .tooltip(Tooltip::text("Go to File"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_tool_call_location(entry_ix, 0, window, cx);
-                    }))
                     .into_any_element()
             } else {
                 h_flex()
@@ -8343,9 +8338,27 @@ impl ThreadView {
                     .into_any()
             })
             .when(!is_edit, |this| this.child(gradient_overlay))
+            .when(has_location, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .id(("open-tool-call-location", entry_ix))
+                        .debug_selector(move || format!("open-tool-call-location-{entry_ix}"))
+                        .tooltip(Tooltip::text("Go to File"))
+                        .cursor(CursorStyle::PointingHand)
+                        .rounded(rems_from_px(3.))
+                        .hover(|s| s.bg(cx.theme().colors().element_hover.opacity(0.5)))
+                        .occlude()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_tool_call_location(entry_ix, 0, window, cx);
+                        })),
+                )
+            })
     }
 
-    fn open_tool_call_location(
+    pub(crate) fn open_tool_call_location(
         &self,
         entry_ix: usize,
         location_ix: usize,
