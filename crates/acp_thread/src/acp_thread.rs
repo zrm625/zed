@@ -102,6 +102,8 @@ pub struct ExternalStatusSurface {
     pub text: Option<SharedString>,
     pub title: Option<SharedString>,
     pub placement: Option<SharedString>,
+    pub severity: Option<SharedString>,
+    pub progress: Option<SharedString>,
     pub lines: Vec<SharedString>,
     pub clear: bool,
 }
@@ -125,6 +127,8 @@ impl ExternalStatusSurface {
             text: string_field(surface, "text"),
             title: string_field(surface, "title"),
             placement: string_field(surface, "placement"),
+            severity: string_field(surface, "severity").or_else(|| string_field(surface, "level")),
+            progress: display_field(surface, "progress"),
             lines,
             clear: surface
                 .get("clear")
@@ -147,6 +151,16 @@ fn string_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<Sh
         .get(key)?
         .as_str()
         .map(|value| value.to_owned().into())
+}
+
+fn display_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<SharedString> {
+    let value = object.get(key)?;
+    match value {
+        Value::String(value) => Some(value.to_owned().into()),
+        Value::Number(value) => Some(value.to_string().into()),
+        Value::Bool(value) => Some(value.to_string().into()),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -3810,6 +3824,8 @@ mod tests {
                                     "key": "circle",
                                     "text": "ready",
                                     "placement": "footer",
+                                    "severity": "warning",
+                                    "progress": 45,
                                     "lines": ["ready", "healthy"]
                                 }),
                             )]),
@@ -3832,6 +3848,11 @@ mod tests {
                 surface.placement.as_ref().map(AsRef::as_ref),
                 Some("footer")
             );
+            assert_eq!(
+                surface.severity.as_ref().map(AsRef::as_ref),
+                Some("warning")
+            );
+            assert_eq!(surface.progress.as_ref().map(AsRef::as_ref), Some("45"));
             assert_eq!(surface.lines.len(), 2);
             assert!(
                 thread.to_markdown(cx).contains("Pi status [circle]: ready"),

@@ -684,13 +684,20 @@ fn external_status_surface_summary(
     }
     let raw_value = values.first().cloned()?;
     let value = bounded_external_status_surface_text(raw_value.clone());
-    let mut details = values.into_iter().skip(1).collect::<Vec<_>>();
+    let mut details = Vec::new();
+    if let Some(severity) = surface.severity.as_ref() {
+        details.push(format!("Severity: {}", severity.as_ref()).into());
+    }
+    if let Some(progress) = surface.progress.as_ref() {
+        details.push(format!("Progress: {}", progress.as_ref()).into());
+    }
     if !matches!(surface.kind.as_ref(), "status" | "persistent_status")
         && let Some(placement) = surface.placement.as_ref()
         && raw_value != *placement
     {
-        details.insert(0, format!("Placement: {}", placement.as_ref()).into());
+        details.push(format!("Placement: {}", placement.as_ref()).into());
     }
+    details.extend(values.into_iter().skip(1));
     let details = bounded_external_status_surface_details(details);
 
     Some(ExternalStatusSurfaceSummary {

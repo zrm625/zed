@@ -5645,6 +5645,8 @@ pub(crate) mod tests {
                                     "kind": "persistent_status",
                                     "key": "circle",
                                     "text": "ready",
+                                    "severity": "warning",
+                                    "progress": "45%",
                                     "lines": ["healthy"]
                                 }),
                             )]),
@@ -5750,7 +5752,9 @@ pub(crate) mod tests {
             assert_eq!(summaries[0].kind.as_ref(), "persistent_status");
             assert_eq!(summaries[0].label.as_ref(), "circle");
             assert_eq!(summaries[0].value.as_ref(), "ready");
-            assert_eq!(summaries[0].details[0].as_ref(), "healthy");
+            assert_eq!(summaries[0].details[0].as_ref(), "Severity: warning");
+            assert_eq!(summaries[0].details[1].as_ref(), "Progress: 45%");
+            assert_eq!(summaries[0].details[2].as_ref(), "healthy");
             assert_eq!(summaries[1].kind.as_ref(), "widget");
             assert_eq!(summaries[1].label.as_ref(), "circle-panel");
             assert_eq!(summaries[1].value.as_ref(), "visible");
