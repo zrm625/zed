@@ -9721,6 +9721,36 @@ impl ThreadView {
             menu_handle.toggle(window, cx);
         });
     }
+
+    fn toggle_config_option_category(
+        &mut self,
+        category: acp::SessionConfigOptionCategory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(config_options_view) = self.config_options_view.clone() else {
+            return false;
+        };
+
+        config_options_view.update(cx, |view, cx| {
+            view.toggle_category_picker(category, window, cx)
+        })
+    }
+
+    fn cycle_config_option_category(
+        &mut self,
+        category: acp::SessionConfigOptionCategory,
+        favorites_only: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(config_options_view) = self.config_options_view.clone() else {
+            return false;
+        };
+
+        config_options_view.update(cx, |view, cx| {
+            view.cycle_category_option(category, favorites_only, cx)
+        })
+    }
 }
 
 impl Render for ThreadView {
@@ -9797,11 +9827,25 @@ impl Render for ThreadView {
                 if this.thread.read(cx).status() != ThreadStatus::Idle {
                     return;
                 }
+                if this.cycle_config_option_category(
+                    acp::SessionConfigOptionCategory::ThoughtLevel,
+                    false,
+                    cx,
+                ) {
+                    return;
+                }
                 this.cycle_thinking_effort(cx);
             }))
             .on_action(
                 cx.listener(|this, action: &ToggleThinkingEffortMenu, window, cx| {
                     if this.thread.read(cx).status() != ThreadStatus::Idle {
+                        return;
+                    }
+                    if this.toggle_config_option_category(
+                        acp::SessionConfigOptionCategory::ThoughtLevel,
+                        window,
+                        cx,
+                    ) {
                         return;
                     }
                     this.toggle_thinking_effort_menu(action, window, cx);
@@ -9824,17 +9868,12 @@ impl Render for ThreadView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleProfileSelector, window, cx| {
-                if let Some(config_options_view) = this.config_options_view.clone() {
-                    let handled = config_options_view.update(cx, |view, cx| {
-                        view.toggle_category_picker(
-                            acp::SessionConfigOptionCategory::Mode,
-                            window,
-                            cx,
-                        )
-                    });
-                    if handled {
-                        return;
-                    }
+                if this.toggle_config_option_category(
+                    acp::SessionConfigOptionCategory::Mode,
+                    window,
+                    cx,
+                ) {
+                    return;
                 }
 
                 if let Some(profile_selector) = this.profile_selector.clone() {
@@ -9847,17 +9886,12 @@ impl Render for ThreadView {
                 if this.thread.read(cx).status() != ThreadStatus::Idle {
                     return;
                 }
-                if let Some(config_options_view) = this.config_options_view.clone() {
-                    let handled = config_options_view.update(cx, |view, cx| {
-                        view.cycle_category_option(
-                            acp::SessionConfigOptionCategory::Mode,
-                            false,
-                            cx,
-                        )
-                    });
-                    if handled {
-                        return;
-                    }
+                if this.cycle_config_option_category(
+                    acp::SessionConfigOptionCategory::Mode,
+                    false,
+                    cx,
+                ) {
+                    return;
                 }
 
                 if let Some(profile_selector) = this.profile_selector.clone() {
@@ -9874,17 +9908,12 @@ impl Render for ThreadView {
                 if this.thread.read(cx).status() != ThreadStatus::Idle {
                     return;
                 }
-                if let Some(config_options_view) = this.config_options_view.clone() {
-                    let handled = config_options_view.update(cx, |view, cx| {
-                        view.toggle_category_picker(
-                            acp::SessionConfigOptionCategory::Model,
-                            window,
-                            cx,
-                        )
-                    });
-                    if handled {
-                        return;
-                    }
+                if this.toggle_config_option_category(
+                    acp::SessionConfigOptionCategory::Model,
+                    window,
+                    cx,
+                ) {
+                    return;
                 }
 
                 if let Some(model_selector) = this.model_selector.clone() {
@@ -9896,17 +9925,12 @@ impl Render for ThreadView {
                 if this.thread.read(cx).status() != ThreadStatus::Idle {
                     return;
                 }
-                if let Some(config_options_view) = this.config_options_view.clone() {
-                    let handled = config_options_view.update(cx, |view, cx| {
-                        view.cycle_category_option(
-                            acp::SessionConfigOptionCategory::Model,
-                            true,
-                            cx,
-                        )
-                    });
-                    if handled {
-                        return;
-                    }
+                if this.cycle_config_option_category(
+                    acp::SessionConfigOptionCategory::Model,
+                    true,
+                    cx,
+                ) {
+                    return;
                 }
 
                 if let Some(model_selector) = this.model_selector.clone() {
