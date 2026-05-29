@@ -7,13 +7,14 @@ base_branch="${BASE_BRANCH:-main}"
 circle_branch="${CIRCLE_BRANCH:-circle/main}"
 
 run() {
+  local command=("$@")
   printf '+ %q' "$1"
   shift
   for argument in "$@"; do
     printf ' %q' "$argument"
   done
   printf '\n'
-  "$@"
+  "${command[@]}"
 }
 
 die() {
