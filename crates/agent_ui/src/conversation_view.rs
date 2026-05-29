@@ -5916,6 +5916,28 @@ pub(crate) mod tests {
         cx.read(|cx| thread.read(cx).message_editor.clone())
     }
 
+    fn assert_revealed_diff_editor_text(
+        entry_view_state: &EntryViewState,
+        thread: &Entity<AcpThread>,
+        entry_ix: usize,
+        expected_text: &str,
+        cx: &App,
+    ) {
+        let diff = thread.read_with(cx, |thread, _| {
+            thread.entries()[entry_ix].diffs().next().cloned().unwrap()
+        });
+        assert!(diff.read(cx).has_revealed_range(cx));
+        let diff_editor = entry_view_state
+            .entry(entry_ix)
+            .unwrap()
+            .editor_for_diff(&diff)
+            .unwrap();
+        assert_eq!(
+            diff_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            expected_text
+        );
+    }
+
     #[gpui::test]
     async fn test_rewind_views(cx: &mut TestAppContext) {
         init_test(cx);
@@ -5994,7 +6016,7 @@ pub(crate) mod tests {
                 .active_thread()
                 .map(|active| active.read(cx).entry_view_state.clone())
                 .unwrap();
-            entry_view_state.read_with(cx, |entry_view_state, _| {
+            entry_view_state.read_with(cx, |entry_view_state, cx| {
                 assert!(
                     entry_view_state
                         .entry(0)
@@ -6003,6 +6025,13 @@ pub(crate) mod tests {
                         .is_some()
                 );
                 assert!(entry_view_state.entry(1).unwrap().has_content());
+                assert_revealed_diff_editor_text(
+                    entry_view_state,
+                    &thread,
+                    1,
+                    "old content 1\nnew content 1",
+                    cx,
+                );
             });
         });
 
@@ -6037,7 +6066,7 @@ pub(crate) mod tests {
                 .read(cx)
                 .entry_view_state
                 .clone();
-            entry_view_state.read_with(cx, |entry_view_state, _| {
+            entry_view_state.read_with(cx, |entry_view_state, cx| {
                 assert!(
                     entry_view_state
                         .entry(0)
@@ -6054,6 +6083,13 @@ pub(crate) mod tests {
                         .is_some()
                 );
                 assert!(entry_view_state.entry(3).unwrap().has_content());
+                assert_revealed_diff_editor_text(
+                    entry_view_state,
+                    &thread,
+                    3,
+                    "old content 2\nnew content 2",
+                    cx,
+                );
             });
         });
 
@@ -6083,6 +6119,13 @@ pub(crate) mod tests {
                             .is_some()
                     );
                     assert!(entry_view_state.entry(1).unwrap().has_content());
+                    assert_revealed_diff_editor_text(
+                        entry_view_state,
+                        &thread,
+                        1,
+                        "old content 1\nnew content 1",
+                        cx,
+                    );
 
                     // Old views should be dropped
                     assert!(entry_view_state.entry(2).is_none());
