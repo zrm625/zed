@@ -1198,6 +1198,7 @@ pub struct AcpThread {
     prompt_capabilities: acp::PromptCapabilities,
     available_commands: Vec<acp::AvailableCommand>,
     external_status_surfaces: HashMap<String, ExternalStatusSurface>,
+    external_status_surface_entry_indices: HashMap<String, usize>,
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
     terminals: HashMap<acp::TerminalId, Entity<Terminal>>,
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
@@ -1409,6 +1410,7 @@ impl AcpThread {
             prompt_capabilities,
             available_commands: Vec::new(),
             external_status_surfaces: HashMap::default(),
+            external_status_surface_entry_indices: HashMap::default(),
             _observe_prompt_capabilities: task,
             terminals: HashMap::default(),
             pending_terminal_output: HashMap::default(),
@@ -1635,14 +1637,15 @@ impl AcpThread {
             }
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, meta, .. }) => {
                 if let Some(surface) = ExternalStatusSurface::from_meta(meta.as_ref()) {
+                    let content_is_empty = content_block_is_empty(&content);
+                    let entry_ix = self.external_status_surface_entry_ix(content_is_empty);
                     if surface.clear {
-                        self.external_status_surfaces.remove(&surface.storage_key());
+                        self.remove_external_status_surface(&surface.storage_key());
                     } else if surface.should_store() {
-                        self.external_status_surfaces
-                            .insert(surface.storage_key(), surface.clone());
+                        self.store_external_status_surface(surface.clone(), entry_ix);
                     }
                     cx.emit(AcpThreadEvent::ExternalStatusSurfaceUpdated(surface));
-                    if content_block_is_empty(&content) {
+                    if content_is_empty {
                         return Ok(());
                     }
                 }
@@ -1827,6 +1830,49 @@ impl AcpThread {
                 }),
                 cx,
             );
+        }
+    }
+
+    fn external_status_surface_entry_ix(&self, content_is_empty: bool) -> usize {
+        if content_is_empty {
+            return self.entries.len();
+        }
+
+        if let Some(AgentThreadEntry::AssistantMessage(AssistantMessage {
+            indented: false, ..
+        })) = self.entries.last()
+        {
+            self.entries.len().saturating_sub(1)
+        } else {
+            self.entries.len()
+        }
+    }
+
+    fn store_external_status_surface(&mut self, surface: ExternalStatusSurface, entry_ix: usize) {
+        let storage_key = surface.storage_key();
+        self.external_status_surfaces
+            .insert(storage_key.clone(), surface);
+        self.external_status_surface_entry_indices
+            .insert(storage_key, entry_ix);
+    }
+
+    fn remove_external_status_surface(&mut self, storage_key: &str) {
+        self.external_status_surfaces.remove(storage_key);
+        self.external_status_surface_entry_indices
+            .remove(storage_key);
+    }
+
+    fn remove_external_status_surfaces_from(&mut self, entry_ix: usize) {
+        let removed_keys = self
+            .external_status_surface_entry_indices
+            .iter()
+            .filter_map(|(key, surface_entry_ix)| {
+                (*surface_entry_ix >= entry_ix).then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for key in removed_keys {
+            self.remove_external_status_surface(&key);
         }
     }
 
@@ -2581,6 +2627,7 @@ impl AcpThread {
                                     // User prompt was refused - truncate back to before the user message
                                     let range = user_msg_ix..this.entries.len();
                                     if range.start < range.end {
+                                        this.remove_external_status_surfaces_from(user_msg_ix);
                                         this.entries.truncate(user_msg_ix);
                                         cx.emit(AcpThreadEvent::EntriesRemoved(range));
                                     }
@@ -2703,6 +2750,7 @@ impl AcpThread {
                         .collect();
 
                     let range = ix..this.entries.len();
+                    this.remove_external_status_surfaces_from(ix);
                     this.entries.truncate(ix);
                     cx.emit(AcpThreadEvent::EntriesRemoved(range));
 
@@ -4078,6 +4126,92 @@ mod tests {
             assert!(
                 markdown.contains("Pi transient: Heads up"),
                 "transient transcript fallback should remain visible"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_rewind_removes_external_status_surfaces_from_truncated_entries(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            |request, thread, mut cx| {
+                async move {
+                    let acp::ContentBlock::Text(content) = &request.prompt[0] else {
+                        panic!("expected text prompt");
+                    };
+                    let key = content.text.to_lowercase();
+                    let text = format!("{} status", content.text);
+                    thread.update(&mut cx, |thread, cx| {
+                        thread
+                            .handle_session_update(
+                                acp::SessionUpdate::AgentMessageChunk(
+                                    acp::ContentChunk::new(text.clone().into()).meta(
+                                        acp::Meta::from_iter([(
+                                            STATUS_SURFACE_META_KEY.into(),
+                                            json!({
+                                                "kind": "persistent_status",
+                                                "key": key,
+                                                "text": text,
+                                            }),
+                                        )]),
+                                    ),
+                                ),
+                                cx,
+                            )
+                            .unwrap();
+                    })?;
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                }
+                .boxed_local()
+            },
+        ));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("First", cx))
+            .await
+            .unwrap();
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Second", cx))
+            .await
+            .unwrap();
+
+        thread.read_with(cx, |thread, _cx| {
+            let surfaces = thread.external_status_surfaces();
+            assert!(surfaces.contains_key("persistent_status:first"));
+            assert!(surfaces.contains_key("persistent_status:second"));
+        });
+
+        let second_message_id = thread.read_with(cx, |thread, _cx| {
+            let AgentThreadEntry::UserMessage(message) = &thread.entries[2] else {
+                panic!("expected second user message");
+            };
+            message.id.clone().unwrap()
+        });
+        thread
+            .update(cx, |thread, cx| thread.rewind(second_message_id, cx))
+            .await
+            .unwrap();
+
+        thread.read_with(cx, |thread, _cx| {
+            let surfaces = thread.external_status_surfaces();
+            assert!(
+                surfaces.contains_key("persistent_status:first"),
+                "status surface from retained history should remain"
+            );
+            assert!(
+                !surfaces.contains_key("persistent_status:second"),
+                "status surface from truncated history should be removed"
             );
         });
     }
