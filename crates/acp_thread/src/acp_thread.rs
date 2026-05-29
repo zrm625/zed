@@ -141,6 +141,10 @@ impl ExternalStatusSurface {
         let key = self.key.as_ref().unwrap_or(&self.kind);
         format!("{}:{}", self.kind.as_ref(), key.as_ref())
     }
+
+    fn should_store(&self) -> bool {
+        !matches!(self.kind.as_ref(), "transient" | "editor_text")
+    }
 }
 
 fn content_block_is_empty(block: &acp::ContentBlock) -> bool {
@@ -1633,7 +1637,7 @@ impl AcpThread {
                 if let Some(surface) = ExternalStatusSurface::from_meta(meta.as_ref()) {
                     if surface.clear {
                         self.external_status_surfaces.remove(&surface.storage_key());
-                    } else {
+                    } else if surface.should_store() {
                         self.external_status_surfaces
                             .insert(surface.storage_key(), surface.clone());
                     }
@@ -4020,6 +4024,60 @@ mod tests {
             assert!(
                 surfaces.contains_key("persistent_widget:circle"),
                 "clearing a status surface should not clear a widget with the same key"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_status_surface_skips_non_persistent_storage(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            for (kind, key, text) in [
+                ("transient", "warning", "Heads up"),
+                ("editor_text", "draft", "prefill"),
+            ] {
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::AgentMessageChunk(
+                            acp::ContentChunk::new(format!("Pi {kind}: {text}").into()).meta(
+                                acp::Meta::from_iter([(
+                                    STATUS_SURFACE_META_KEY.into(),
+                                    json!({
+                                        "kind": kind,
+                                        "key": key,
+                                        "text": text
+                                    }),
+                                )]),
+                            ),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            }
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            assert!(
+                thread.external_status_surfaces().is_empty(),
+                "transient and editor-text surfaces should not be retained invisibly"
+            );
+            let markdown = thread.to_markdown(cx);
+            assert!(
+                markdown.contains("Pi transient: Heads up"),
+                "transient transcript fallback should remain visible"
             );
         });
     }
