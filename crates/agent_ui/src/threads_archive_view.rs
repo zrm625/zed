@@ -33,8 +33,8 @@ use settings::Settings as _;
 use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, Divider, KeyBinding, ListItem, ListItemSpacing, ListSubHeader, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, Tooltip, WithScrollbar, prelude::*,
-    utils::platform_title_bar_height,
+    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, Tooltip, WithScrollbar, WorktreeKind,
+    prelude::*, utils::platform_title_bar_height,
 };
 use ui_input::ErasedEditor;
 use util::ResultExt;
@@ -641,10 +641,13 @@ impl ThreadsArchiveView {
                     })
                     .unwrap_or_default();
 
-                let worktrees = worktree_info_from_thread_paths(
+                let mut worktrees = worktree_info_from_thread_paths(
                     &thread.worktree_paths,
                     &branch_names_for_thread,
                 );
+                if let Some(lineage) = session_lineage_worktree_info(thread.meta.as_ref()) {
+                    worktrees.push(lineage);
+                }
 
                 let archived_color = Color::Custom(cx.theme().colors().icon_muted.opacity(0.6));
 
@@ -1016,6 +1019,51 @@ pub fn format_history_entry_timestamp(entry_time: DateTime<Utc>) -> String {
     } else {
         format!("{}mo", months.max(1))
     }
+}
+
+fn session_lineage_worktree_info(meta: Option<&acp::Meta>) -> Option<ThreadItemWorktreeInfo> {
+    let pi_meta = meta?.get("pi")?;
+    let branch_depth = pi_meta
+        .get("branchDepth")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    let child_count = pi_meta
+        .get("childSessionCount")
+        .and_then(|value| value.as_u64())
+        .or_else(|| {
+            pi_meta
+                .get("childSessionIds")
+                .and_then(|value| value.as_array())
+                .map(|children| children.len() as u64)
+        })
+        .unwrap_or_default();
+
+    let label = session_lineage_label(branch_depth, child_count)?;
+    Some(ThreadItemWorktreeInfo {
+        worktree_name: None,
+        branch_name: Some(label.into()),
+        full_path: "".into(),
+        highlight_positions: Vec::new(),
+        kind: WorktreeKind::Linked,
+    })
+}
+
+fn session_lineage_label(branch_depth: u64, child_count: u64) -> Option<String> {
+    if branch_depth == 0 && child_count == 0 {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if branch_depth > 0 {
+        parts.push(format!("depth {branch_depth}"));
+    }
+    if child_count == 1 {
+        parts.push("1 child".to_string());
+    } else if child_count > 1 {
+        parts.push(format!("{child_count} children"));
+    }
+
+    Some(parts.join(", "))
 }
 
 impl Focusable for ThreadsArchiveView {
@@ -1679,5 +1727,34 @@ mod tests {
                 "position {pos} is not a valid UTF-8 boundary in {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_session_lineage_label_formats_depth_and_children() {
+        assert_eq!(session_lineage_label(0, 0), None);
+        assert_eq!(session_lineage_label(2, 0).as_deref(), Some("depth 2"));
+        assert_eq!(session_lineage_label(0, 1).as_deref(), Some("1 child"));
+        assert_eq!(
+            session_lineage_label(3, 2).as_deref(),
+            Some("depth 3, 2 children")
+        );
+    }
+
+    #[test]
+    fn test_session_lineage_worktree_info_reads_pi_meta() {
+        let meta = acp::Meta::from_iter([(
+            "pi".to_string(),
+            serde_json::json!({
+                "branchDepth": 2,
+                "childSessionIds": ["child-a", "child-b"]
+            }),
+        )]);
+
+        let info = session_lineage_worktree_info(Some(&meta))
+            .expect("lineage metadata should produce a visible history chip");
+
+        assert_eq!(info.worktree_name, None);
+        assert_eq!(info.branch_name.as_deref(), Some("depth 2, 2 children"));
+        assert_eq!(info.kind, WorktreeKind::Linked);
     }
 }
