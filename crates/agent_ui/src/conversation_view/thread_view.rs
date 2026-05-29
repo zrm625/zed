@@ -618,6 +618,19 @@ impl PermissionTextPrompt {
     }
 }
 
+fn merge_permission_outcome_meta(
+    mut outcome: SelectedPermissionOutcome,
+    extra_meta: Option<acp::Meta>,
+) -> SelectedPermissionOutcome {
+    let Some(extra_meta) = extra_meta else {
+        return outcome;
+    };
+    let mut meta = outcome.meta.take().unwrap_or_default();
+    meta.extend(extra_meta);
+    outcome.meta = Some(meta);
+    outcome
+}
+
 #[cfg(test)]
 mod permission_text_prompt_tests {
     use super::*;
@@ -770,6 +783,7 @@ pub struct ThreadView {
     pub resumed_without_history: bool,
     pub(crate) permission_selections: HashMap<acp::ToolCallId, PermissionSelection>,
     permission_text_editors: RefCell<HashMap<acp::ToolCallId, Entity<Editor>>>,
+    permission_text_editor_subscriptions: RefCell<HashMap<acp::ToolCallId, Subscription>>,
     pub _cancel_task: Option<Task<()>>,
     _save_task: Option<Task<()>>,
     _draft_resolve_task: Option<Task<()>>,
@@ -1086,6 +1100,7 @@ impl ThreadView {
             new_server_version_available: None,
             permission_selections: HashMap::default(),
             permission_text_editors: RefCell::new(HashMap::default()),
+            permission_text_editor_subscriptions: RefCell::new(HashMap::default()),
             _cancel_task: None,
             _save_task: None,
             _draft_resolve_task: None,
@@ -1110,6 +1125,7 @@ impl ThreadView {
 
         this.sync_generating_indicator(cx);
         this.sync_editor_mode_for_empty_state(cx);
+        this.sync_pending_permission_text_prompt_editors(window, cx);
         let list_state_for_scroll = this.list_state.clone();
         let thread_view = cx.entity().downgrade();
 
@@ -2404,13 +2420,19 @@ impl ThreadView {
             cx.notify();
             return;
         }
-        self.authorize_tool_call(
-            session_id,
-            tool_call_id,
-            SelectedPermissionOutcome::new(option_id, option_kind),
-            window,
+        let is_allow = matches!(
+            option_kind,
+            acp::PermissionOptionKind::AllowOnce | acp::PermissionOptionKind::AllowAlways
+        );
+        let extra_meta = self.permission_text_prompt_value_meta(&tool_call_id, is_allow, cx);
+        let outcome = self.selected_permission_outcome_for_action(
+            &tool_call_id,
+            &option_id,
+            option_kind,
+            extra_meta,
             cx,
         );
+        self.authorize_tool_call(session_id, tool_call_id, outcome, window, cx);
     }
 
     pub fn handle_select_permission_granularity(
@@ -2534,6 +2556,78 @@ impl ThreadView {
         self.permission_text_editors
             .borrow_mut()
             .remove(tool_call_id);
+        self.permission_text_editor_subscriptions
+            .borrow_mut()
+            .remove(tool_call_id);
+    }
+
+    fn selected_permission_outcome_for_action(
+        &self,
+        tool_call_id: &acp::ToolCallId,
+        option_id: &acp::PermissionOptionId,
+        option_kind: acp::PermissionOptionKind,
+        extra_meta: Option<acp::Meta>,
+        cx: &App,
+    ) -> SelectedPermissionOutcome {
+        let is_allow = matches!(
+            option_kind,
+            acp::PermissionOptionKind::AllowOnce | acp::PermissionOptionKind::AllowAlways
+        );
+        let outcome = self
+            .thread
+            .read(cx)
+            .tool_call(tool_call_id)
+            .and_then(|(_, tool_call)| {
+                let ToolCallStatus::WaitingForConfirmation { options, .. } = &tool_call.status
+                else {
+                    return None;
+                };
+                self.selected_permission_outcome_from_options(
+                    options,
+                    tool_call_id,
+                    option_id,
+                    is_allow,
+                )
+            })
+            .unwrap_or_else(|| SelectedPermissionOutcome::new(option_id.clone(), option_kind));
+
+        merge_permission_outcome_meta(outcome, extra_meta)
+    }
+
+    fn selected_permission_outcome_from_options(
+        &self,
+        options: &PermissionOptions,
+        tool_call_id: &acp::ToolCallId,
+        option_id: &acp::PermissionOptionId,
+        is_allow: bool,
+    ) -> Option<SelectedPermissionOutcome> {
+        if let Some(PermissionSelection::SelectedPatterns(checked)) =
+            self.permission_selections.get(tool_call_id)
+            && let Some(outcome) = options.build_outcome_for_checked_patterns(checked, is_allow)
+        {
+            return Some(outcome);
+        }
+
+        match options {
+            PermissionOptions::Flat(options) => options
+                .iter()
+                .find(|option| &option.option_id == option_id)
+                .map(|option| {
+                    SelectedPermissionOutcome::new(option.option_id.clone(), option.kind)
+                        .meta(option.meta.clone())
+                }),
+            PermissionOptions::Dropdown(choices)
+            | PermissionOptions::DropdownWithPatterns { choices, .. } => choices
+                .iter()
+                .find(|choice| {
+                    if is_allow {
+                        &choice.allow.option_id == option_id
+                    } else {
+                        &choice.deny.option_id == option_id
+                    }
+                })
+                .map(|choice| choice.build_outcome(is_allow)),
+        }
     }
 
     fn permission_text_prompt_allows_authorization(
@@ -7701,6 +7795,7 @@ impl ThreadView {
                 entry_ix,
                 session_id,
                 tool_call_id.clone(),
+                text_prompt.as_ref(),
                 focus_handle,
                 cx,
             ),
@@ -7715,6 +7810,7 @@ impl ThreadView {
                 entry_ix,
                 session_id,
                 tool_call_id.clone(),
+                text_prompt.as_ref(),
                 focus_handle,
                 cx,
             ),
@@ -7796,9 +7892,44 @@ impl ThreadView {
             editor.set_text(prompt.initial_value, window, cx);
             editor
         });
+        let editor_for_subscription = editor.clone();
         self.permission_text_editors
             .borrow_mut()
             .insert(tool_call_id.clone(), editor);
+        let subscription = cx.observe(&editor_for_subscription, |_this, _editor, cx| cx.notify());
+        self.permission_text_editor_subscriptions
+            .borrow_mut()
+            .insert(tool_call_id.clone(), subscription);
+    }
+
+    fn sync_pending_permission_text_prompt_editors(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pending_prompt_ids = self
+            .thread
+            .read(cx)
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                    return None;
+                };
+                if !matches!(
+                    tool_call.status,
+                    ToolCallStatus::WaitingForConfirmation { .. }
+                ) {
+                    return None;
+                }
+                PermissionTextPrompt::from_meta(tool_call.meta.as_ref())?;
+                Some(tool_call.id.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for tool_call_id in pending_prompt_ids {
+            self.sync_permission_text_prompt_editor(&tool_call_id, window, cx);
+        }
     }
 
     fn render_permission_buttons_with_dropdown(
@@ -7809,6 +7940,7 @@ impl ThreadView {
         entry_ix: usize,
         session_id: acp::SessionId,
         tool_call_id: acp::ToolCallId,
+        text_prompt: Option<&PermissionTextPrompt>,
         focus_handle: &FocusHandle,
         cx: &Context<Self>,
     ) -> Div {
@@ -7851,6 +7983,20 @@ impl ThreadView {
                 cx,
             )
         };
+        let text_editor = text_prompt.and_then(|_| {
+            self.permission_text_editors
+                .borrow()
+                .get(&tool_call_id)
+                .cloned()
+        });
+        let allow_disabled_for_required_text = text_prompt.is_some_and(|prompt| {
+            prompt.required
+                && text_editor
+                    .as_ref()
+                    .map(|editor| editor.read(cx).text(cx))
+                    .as_deref()
+                    .map_or(true, |value| !prompt.allows_value(value))
+        });
 
         h_flex()
             .w_full()
@@ -7880,6 +8026,7 @@ impl ThreadView {
                                     .map(|kb| kb.size(rems_from_px(12.))),
                                 )
                             })
+                            .disabled(allow_disabled_for_required_text)
                             .on_click(cx.listener({
                                 let session_id = session_id.clone();
                                 let tool_call_id = tool_call_id.clone();
