@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sync Circle Upstream"
+  short_description: "Sync upstream into Circle."
+  default_prompt: "Sync upstream/main into circle/main and keep the fork main clean."
