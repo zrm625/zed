@@ -3495,10 +3495,8 @@ pub(crate) mod tests {
             setup_conversation_view(StubAgentServer::new(connection), cx).await;
         add_to_workspace(conversation_view.clone(), cx);
 
-        let editor_focus_handle =
-            message_editor(&conversation_view, cx).read_with(cx, |editor, cx| {
-                editor.focus_handle(cx)
-            });
+        let editor_focus_handle = message_editor(&conversation_view, cx)
+            .read_with(cx, |editor, cx| editor.focus_handle(cx));
         cx.update(|window, cx| {
             window.focus(&editor_focus_handle, cx);
         });
@@ -4057,9 +4055,8 @@ pub(crate) mod tests {
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
 
-        let session_id = active_thread(&conversation_view, cx).read_with(cx, |thread, cx| {
-            thread.thread.read(cx).session_id().clone()
-        });
+        let session_id = active_thread(&conversation_view, cx)
+            .read_with(cx, |thread, cx| thread.thread.read(cx).session_id().clone());
 
         cx.update(|_, cx| {
             connection.send_update(
@@ -4072,9 +4069,8 @@ pub(crate) mod tests {
         });
         cx.run_until_parked();
 
-        let title_editor_text = active_thread(&conversation_view, cx).read_with(cx, |thread, cx| {
-            thread.title_editor.read(cx).text(cx)
-        });
+        let title_editor_text = active_thread(&conversation_view, cx)
+            .read_with(cx, |thread, cx| thread.title_editor.read(cx).text(cx));
 
         assert_eq!(
             title_editor_text, "Circle Session",

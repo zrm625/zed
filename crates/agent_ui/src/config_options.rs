@@ -915,11 +915,21 @@ mod tests {
     }
 
     #[gpui::test]
-    fn cycling_thought_level_config_option_saves_selected_value_as_default(
+    fn cycling_model_and_thought_config_options_saves_selected_values_as_defaults(
         cx: &mut TestAppContext,
     ) {
         let agent_server = Rc::new(TestAgentServer::default());
         let config_options = Rc::new(TestSessionConfigOptions::new(vec![
+            acp::SessionConfigOption::select(
+                "model",
+                "Model",
+                "gpt-4.1",
+                vec![
+                    acp::SessionConfigSelectOption::new("gpt-4.1", "GPT-4.1"),
+                    acp::SessionConfigSelectOption::new("gpt-5", "GPT-5"),
+                ],
+            )
+            .category(acp::SessionConfigOptionCategory::Model),
             acp::SessionConfigOption::select(
                 "thinking_level",
                 "Thinking",
@@ -947,6 +957,9 @@ mod tests {
             });
 
             assert!(view.update(cx, |view, cx| {
+                view.cycle_category_option(acp::SessionConfigOptionCategory::Model, false, cx)
+            }));
+            assert!(view.update(cx, |view, cx| {
                 view.cycle_category_option(
                     acp::SessionConfigOptionCategory::ThoughtLevel,
                     false,
@@ -957,11 +970,68 @@ mod tests {
 
         assert_eq!(
             agent_server.saved_defaults.lock().as_slice(),
-            &[("thinking_level".to_string(), Some("high".to_string()))]
+            &[
+                ("model".to_string(), Some("gpt-5".to_string())),
+                ("thinking_level".to_string(), Some("high".to_string())),
+            ]
         );
         assert_eq!(
             config_options.set_values.borrow().as_slice(),
-            &[("thinking_level".to_string(), "high".to_string())]
+            &[
+                ("model".to_string(), "gpt-5".to_string()),
+                ("thinking_level".to_string(), "high".to_string()),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn custom_category_config_option_cycles_through_generic_selector(cx: &mut TestAppContext) {
+        let agent_server = Rc::new(TestAgentServer::default());
+        let config_options = Rc::new(TestSessionConfigOptions::new(vec![
+            acp::SessionConfigOption::select(
+                "auto_compaction",
+                "Compaction",
+                "enabled",
+                vec![
+                    acp::SessionConfigSelectOption::new("enabled", "Auto compaction on"),
+                    acp::SessionConfigSelectOption::new("disabled", "Auto compaction off"),
+                ],
+            )
+            .category(acp::SessionConfigOptionCategory::Other(
+                "_compaction".to_string(),
+            )),
+        ]));
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            let config_options: Rc<dyn AgentSessionConfigOptions> = config_options.clone();
+            let agent_server: Rc<dyn AgentServer> = agent_server.clone();
+            let fs = fs.clone();
+            let view = cx.new(|_| ConfigOptionsView {
+                config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
+                config_options,
+                selectors: Vec::new(),
+                agent_server,
+                fs,
+                _refresh_task: Task::ready(()),
+            });
+
+            assert!(view.update(cx, |view, cx| {
+                view.cycle_category_option(
+                    acp::SessionConfigOptionCategory::Other("_compaction".to_string()),
+                    false,
+                    cx,
+                )
+            }));
+        });
+
+        assert_eq!(
+            agent_server.saved_defaults.lock().as_slice(),
+            &[("auto_compaction".to_string(), Some("disabled".to_string()))]
+        );
+        assert_eq!(
+            config_options.set_values.borrow().as_slice(),
+            &[("auto_compaction".to_string(), "disabled".to_string())]
         );
     }
 
