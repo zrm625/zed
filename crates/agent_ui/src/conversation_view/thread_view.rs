@@ -491,7 +491,7 @@ mod numbered_code_block_tests {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HistoryFilterKind {
+pub(crate) enum HistoryFilterKind {
     UserMessages,
     AssistantMessages,
     Thinking,
@@ -859,6 +859,7 @@ impl ThreadView {
     ) -> Self {
         let session_id = thread.read(cx).session_id().clone();
         let parent_session_id = thread.read(cx).parent_session_id().cloned();
+        let visible_history_entries = (0..thread.read(cx).entries().len()).collect();
 
         let has_slash_completions = session_capabilities.read().has_slash_completions();
         let placeholder = placeholder_text(agent_display_name.as_ref(), has_slash_completions);
@@ -1095,7 +1096,7 @@ impl ThreadView {
             skill_loading_errors: Vec::new(),
             dismissed_skill_loading_errors: HashSet::default(),
             history_filters: HistoryVisibilityFilters::default(),
-            visible_history_entries: Vec::new(),
+            visible_history_entries,
         };
 
         this.sync_history_filter_projection(cx);
@@ -3093,6 +3094,7 @@ impl ThreadView {
 
     fn collect_subagent_items_for_sessions(
         entries: &[AgentThreadEntry],
+        visible_history_entries: &[usize],
         awaiting_session_ids: &[acp::SessionId],
         cx: &App,
     ) -> Vec<(SharedString, usize)> {
@@ -3116,7 +3118,13 @@ impl ThreadView {
 
         awaiting_session_ids
             .iter()
-            .filter_map(|session_id| tool_calls_by_session.get(session_id).cloned())
+            .filter_map(|session_id| {
+                let (summary, entry_ix) = tool_calls_by_session.get(session_id)?;
+                let visible_ix = visible_history_entries
+                    .iter()
+                    .position(|visible_entry_ix| visible_entry_ix == entry_ix)?;
+                Some((summary.clone(), visible_ix))
+            })
             .collect()
     }
 
@@ -3134,8 +3142,12 @@ impl ThreadView {
 
         let thread = self.thread.read(cx);
         let entries = thread.entries();
-        let subagent_items =
-            Self::collect_subagent_items_for_sessions(entries, &awaiting_session_ids, cx);
+        let subagent_items = Self::collect_subagent_items_for_sessions(
+            entries,
+            &self.visible_history_entries,
+            &awaiting_session_ids,
+            cx,
+        );
 
         if subagent_items.is_empty() {
             return None;
@@ -3162,13 +3174,13 @@ impl ThreadView {
                 )
                 .child(
                     v_flex().children(subagent_items.into_iter().enumerate().map(
-                        |(ix, (label, entry_ix))| {
+                        |(ix, (label, visible_ix))| {
                             let is_last = ix == item_count - 1;
-                            let group = format!("group-{}", entry_ix);
+                            let group = format!("group-{}", visible_ix);
 
                             h_flex()
                                 .cursor_pointer()
-                                .id(format!("subagent-permission-{}", entry_ix))
+                                .id(format!("subagent-permission-{}", visible_ix))
                                 .group(&group)
                                 .p_1()
                                 .pl_2()
@@ -3206,7 +3218,7 @@ impl ThreadView {
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.list_state.scroll_to(ListOffset {
-                                        item_ix: entry_ix,
+                                        item_ix: visible_ix,
                                         offset_in_item: px(0.0),
                                     });
                                     cx.notify();
@@ -3220,10 +3232,10 @@ impl ThreadView {
 
     /// Returns true when the entry has been measured and sits entirely below
     /// the current viewport.
-    fn entry_is_below_viewport(&self, entry_ix: usize) -> bool {
+    fn entry_is_below_viewport(&self, visible_ix: usize) -> bool {
         let viewport_bounds = self.list_state.viewport_bounds();
         self.list_state
-            .bounds_for_item(entry_ix)
+            .bounds_for_item(visible_ix)
             .is_some_and(|entry_bounds| entry_bounds.top() >= viewport_bounds.bottom())
     }
 
@@ -3243,8 +3255,9 @@ impl ThreadView {
 
         let thread = self.thread.read(cx);
         let (entry_ix, tool_call) = thread.tool_call(&tool_call_id)?;
+        let visible_ix = self.visible_index_for_entry(entry_ix)?;
 
-        if !self.entry_is_below_viewport(entry_ix) {
+        if !self.entry_is_below_viewport(visible_ix) {
             return None;
         }
 
@@ -3295,7 +3308,7 @@ impl ThreadView {
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.list_state.scroll_to(ListOffset {
-                            item_ix: entry_ix,
+                            item_ix: visible_ix,
                             offset_in_item: px(0.0),
                         });
                         cx.notify();
@@ -5248,6 +5261,36 @@ impl Render for TokenUsageTooltip {
 }
 
 impl ThreadView {
+    #[cfg(test)]
+    pub(crate) fn set_history_filter_enabled_for_test(
+        &mut self,
+        kind: HistoryFilterKind,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match kind {
+            HistoryFilterKind::UserMessages => self.history_filters.user_messages = enabled,
+            HistoryFilterKind::AssistantMessages => {
+                self.history_filters.assistant_messages = enabled
+            }
+            HistoryFilterKind::Thinking => self.history_filters.thinking = enabled,
+            HistoryFilterKind::ToolCalls => self.history_filters.tool_calls = enabled,
+            HistoryFilterKind::ToolResults => self.history_filters.tool_results = enabled,
+            HistoryFilterKind::PermissionRequests => {
+                self.history_filters.permission_requests = enabled
+            }
+            HistoryFilterKind::ErrorsAndCancels => {
+                self.history_filters.errors_and_cancels = enabled
+            }
+        }
+        self.sync_history_filter_projection(cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_history_entries_for_test(&self) -> &[usize] {
+        &self.visible_history_entries
+    }
+
     fn toggle_history_filter(
         &mut self,
         kind: HistoryFilterKind,
@@ -5985,6 +6028,7 @@ impl ThreadView {
         if let Some(ix) = entries
             .iter()
             .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .and_then(|entry_ix| self.visible_index_for_entry(entry_ix))
         {
             self.list_state.scroll_to(ListOffset {
                 item_ix: ix,
@@ -6091,9 +6135,13 @@ impl ThreadView {
     ) {
         let entries = self.thread.read(cx).entries();
         let current_ix = self.list_state.logical_scroll_top().item_ix;
-        if let Some(target_ix) = (0..current_ix)
+        let visible_entries = &self.visible_history_entries;
+        if let Some(target_ix) = visible_entries[..current_ix.min(visible_entries.len())]
+            .iter()
             .rev()
+            .copied()
             .find(|&i| matches!(entries.get(i), Some(AgentThreadEntry::UserMessage(_))))
+            .and_then(|entry_ix| self.visible_index_for_entry(entry_ix))
         {
             self.list_state.scroll_to(ListOffset {
                 item_ix: target_ix,
@@ -6111,8 +6159,18 @@ impl ThreadView {
     ) {
         let entries = self.thread.read(cx).entries();
         let current_ix = self.list_state.logical_scroll_top().item_ix;
-        if let Some(target_ix) = (current_ix + 1..entries.len())
-            .find(|&i| matches!(entries.get(i), Some(AgentThreadEntry::UserMessage(_))))
+        let visible_entries = &self.visible_history_entries;
+        if let Some(target_ix) = visible_entries
+            .iter()
+            .enumerate()
+            .skip(current_ix.saturating_add(1))
+            .find_map(|(visible_ix, &entry_ix)| {
+                matches!(
+                    entries.get(entry_ix),
+                    Some(AgentThreadEntry::UserMessage(_))
+                )
+                .then_some(visible_ix)
+            })
         {
             self.list_state.scroll_to(ListOffset {
                 item_ix: target_ix,
@@ -6201,25 +6259,68 @@ impl ThreadView {
 
     pub(crate) fn sync_history_filter_projection(&mut self, cx: &App) {
         let entries = self.thread.read(cx).entries();
-        self.visible_history_entries = entries
+        let next_visible_entries = entries
             .iter()
             .enumerate()
             .filter_map(|(ix, entry)| self.history_filters.allows_entry(entry).then_some(ix))
             .collect();
-        self.sync_history_filter_item_count();
+        self.set_visible_history_entries(next_visible_entries, cx);
     }
 
-    fn sync_history_filter_item_count(&mut self) {
-        let desired_count =
-            self.visible_history_entries.len() + usize::from(self.generating_indicator_in_list);
-        let current_count = self.list_state.item_count();
+    fn visible_index_for_entry(&self, entry_ix: usize) -> Option<usize> {
+        self.visible_history_entries
+            .iter()
+            .position(|visible_entry_ix| *visible_entry_ix == entry_ix)
+    }
 
-        if desired_count > current_count {
-            self.list_state
-                .splice(current_count..current_count, desired_count - current_count);
-        } else if desired_count < current_count {
-            self.list_state.splice(desired_count..current_count, 0);
+    fn focus_handles_for_entries(
+        &self,
+        entry_indexes: &[usize],
+        cx: &App,
+    ) -> Vec<Option<FocusHandle>> {
+        let entry_view_state = self.entry_view_state.read(cx);
+        entry_indexes
+            .iter()
+            .map(|entry_ix| {
+                entry_view_state
+                    .entry(*entry_ix)
+                    .and_then(|entry| entry.focus_handle(cx))
+            })
+            .collect()
+    }
+
+    fn set_visible_history_entries(&mut self, next_visible_entries: Vec<usize>, cx: &App) {
+        if self.visible_history_entries == next_visible_entries {
+            return;
         }
+
+        let mut unchanged_prefix_len = 0;
+        while unchanged_prefix_len < self.visible_history_entries.len()
+            && unchanged_prefix_len < next_visible_entries.len()
+            && self.visible_history_entries[unchanged_prefix_len]
+                == next_visible_entries[unchanged_prefix_len]
+        {
+            unchanged_prefix_len += 1;
+        }
+
+        let mut old_suffix_start = self.visible_history_entries.len();
+        let mut new_suffix_start = next_visible_entries.len();
+        while old_suffix_start > unchanged_prefix_len
+            && new_suffix_start > unchanged_prefix_len
+            && self.visible_history_entries[old_suffix_start - 1]
+                == next_visible_entries[new_suffix_start - 1]
+        {
+            old_suffix_start -= 1;
+            new_suffix_start -= 1;
+        }
+
+        let focus_handles = self.focus_handles_for_entries(
+            &next_visible_entries[unchanged_prefix_len..new_suffix_start],
+            cx,
+        );
+        self.list_state
+            .splice_focusable(unchanged_prefix_len..old_suffix_start, focus_handles);
+        self.visible_history_entries = next_visible_entries;
     }
 
     /// Ensures the list item count includes (or excludes) an extra item for the generating indicator
