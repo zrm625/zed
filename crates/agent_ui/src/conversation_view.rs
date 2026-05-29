@@ -296,6 +296,7 @@ impl Conversation {
                     | AcpThreadEvent::ModeUpdated(_)
                     | AcpThreadEvent::ConfigOptionsUpdated(_)
                     | AcpThreadEvent::WorkingDirectoriesUpdated
+                    | AcpThreadEvent::ExternalStatusSurfaceUpdated(_)
                     | AcpThreadEvent::PromptUpdated => {}
                 }
             }
@@ -513,6 +514,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ModeUpdated(_)
         | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::SubagentSpawned(_)
+        | AcpThreadEvent::ExternalStatusSurfaceUpdated(_)
         | AcpThreadEvent::PromptUpdated => false,
     }
 }
@@ -1757,6 +1759,14 @@ impl ConversationView {
                 cx.notify();
             }
             AcpThreadEvent::WorkingDirectoriesUpdated => {
+                cx.notify();
+            }
+            AcpThreadEvent::ExternalStatusSurfaceUpdated(surface) => {
+                if let Some(active) = self.thread_view(&session_id) {
+                    active.update(cx, |active, cx| {
+                        active.apply_external_status_surface(surface, window, cx);
+                    });
+                }
                 cx.notify();
             }
             AcpThreadEvent::PromptUpdated => {
@@ -5936,6 +5946,253 @@ pub(crate) mod tests {
             diff_editor.read_with(cx, |editor, cx| editor.text(cx)),
             expected_text
         );
+    }
+
+    #[gpui::test]
+    async fn test_external_status_surfaces_render_native_activity_summary(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        let active = active_thread(&conversation_view, cx);
+        let thread = cx.read(|cx| active.read(cx).thread.clone());
+        let long_widget_value = "visible ".repeat(32);
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("Pi status [circle]: ready".into()).meta(
+                            acp::Meta::from_iter([(
+                                acp_thread::STATUS_SURFACE_META_KEY.into(),
+                                json!({
+                                    "kind": "persistent_status",
+                                    "key": "circle",
+                                    "text": "ready",
+                                    "severity": "warning",
+                                    "progress": "45%",
+                                    "lines": ["healthy"]
+                                }),
+                            )]),
+                        ),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("Pi widget [circle-panel]: visible".into()).meta(
+                            acp::Meta::from_iter([(
+                                acp_thread::STATUS_SURFACE_META_KEY.into(),
+                                json!({
+                                    "kind": "widget",
+                                    "key": "circle-panel",
+                                    "text": "visible",
+                                    "placement": "activity_bar",
+                                    "lines": ["detail"]
+                                }),
+                            )]),
+                        ),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new(
+                            "Pi widget [circle-persistent-panel]: persistent visible".into(),
+                        )
+                        .meta(acp::Meta::from_iter([(
+                            acp_thread::STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "persistent_widget",
+                                "key": "circle-persistent-panel",
+                                "text": long_widget_value,
+                                "placement": "below_editor",
+                                "lines": [
+                                    "persistent detail",
+                                    "persistent detail 2",
+                                    "persistent detail 3",
+                                    "persistent detail 4",
+                                    "persistent detail 5",
+                                    "persistent detail 6"
+                                ]
+                            }),
+                        )])),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("Pi notify: hello".into()).meta(
+                            acp::Meta::from_iter([(
+                                acp_thread::STATUS_SURFACE_META_KEY.into(),
+                                json!({
+                                    "kind": "transient",
+                                    "key": "notice",
+                                    "text": "hello"
+                                }),
+                            )]),
+                        ),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("".into()).meta(
+                        acp::Meta::from_iter([(
+                            acp_thread::STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "editor_text",
+                                "text": "draft from Pi"
+                            }),
+                        )]),
+                    )),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        let editor_text =
+            message_editor(&conversation_view, cx).update(cx, |editor, cx| editor.text(cx));
+        assert_eq!(
+            editor_text, "draft from Pi",
+            "editor_text status surfaces should update the native Agent Panel message editor"
+        );
+
+        active.update_in(cx, |view, window, cx| {
+            let summaries = view.external_status_surface_summaries(cx);
+            assert_eq!(
+                summaries.len(),
+                3,
+                "transient notifications and editor text should not persist in the native surface summary"
+            );
+            assert_eq!(summaries[0].kind.as_ref(), "persistent_status");
+            assert_eq!(summaries[0].label.as_ref(), "circle");
+            assert_eq!(summaries[0].value.as_ref(), "ready");
+            assert_eq!(summaries[0].details[0].as_ref(), "Severity: warning");
+            assert_eq!(summaries[0].details[1].as_ref(), "Progress: 45%");
+            assert_eq!(summaries[0].details[2].as_ref(), "healthy");
+            assert_eq!(summaries[1].kind.as_ref(), "widget");
+            assert_eq!(summaries[1].label.as_ref(), "circle-panel");
+            assert_eq!(summaries[1].value.as_ref(), "visible");
+            assert_eq!(summaries[1].details[0].as_ref(), "Placement: activity_bar");
+            assert_eq!(summaries[1].details[1].as_ref(), "detail");
+            assert_eq!(summaries[2].kind.as_ref(), "persistent_widget");
+            assert_eq!(summaries[2].label.as_ref(), "circle-persistent-panel");
+            assert!(
+                summaries[2].value.as_ref().starts_with("visible visible"),
+                "long widget text should retain its leading value"
+            );
+            assert!(
+                summaries[2].value.as_ref().ends_with("..."),
+                "long widget text should be truncated in the native summary"
+            );
+            assert!(
+                summaries[2].value.as_ref().chars().count() <= 160,
+                "long widget text should stay bounded in the native summary"
+            );
+            assert_eq!(summaries[2].details[0].as_ref(), "Placement: below_editor");
+            assert_eq!(summaries[2].details[1].as_ref(), "persistent detail");
+            assert_eq!(summaries[2].details[2].as_ref(), "persistent detail 2");
+            assert_eq!(summaries[2].details[3].as_ref(), "persistent detail 3");
+            assert_eq!(
+                summaries[2].details[4].as_ref(),
+                "+3 more",
+                "native widget details should summarize extra metadata lines"
+            );
+            assert!(
+                view.render_activity_bar(window, cx).is_some(),
+                "external status/widget surfaces should render a native activity summary even without plan/edit/queue items",
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("".into()).meta(
+                        acp::Meta::from_iter([(
+                            acp_thread::STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "persistent_status",
+                                "key": "circle",
+                                "clear": true
+                            }),
+                        )]),
+                    )),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("".into()).meta(
+                        acp::Meta::from_iter([(
+                            acp_thread::STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "persistent_widget",
+                                "key": "circle-persistent-panel",
+                                "clear": true
+                            }),
+                        )]),
+                    )),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("".into()).meta(
+                        acp::Meta::from_iter([(
+                            acp_thread::STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "widget",
+                                "key": "circle-panel",
+                                "clear": true
+                            }),
+                        )]),
+                    )),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("".into()).meta(
+                        acp::Meta::from_iter([(
+                            acp_thread::STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "editor_text",
+                                "clear": true
+                            }),
+                        )]),
+                    )),
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        let editor_text =
+            message_editor(&conversation_view, cx).update(cx, |editor, cx| editor.text(cx));
+        assert_eq!(
+            editor_text, "",
+            "clear editor_text metadata should clear the native Agent Panel message editor"
+        );
+
+        active.update_in(cx, |view, window, cx| {
+            assert!(
+                view.external_status_surface_summaries(cx).is_empty(),
+                "clear metadata should remove the native status summary entry"
+            );
+            assert!(
+                view.render_activity_bar(window, cx).is_none(),
+                "cleared external status surfaces should not keep the activity bar visible"
+            );
+        });
     }
 
     #[gpui::test]

@@ -25,7 +25,7 @@ use project::{
     git_store::{GitStoreCheckpoint, GitStoreEvent, RepositoryEvent},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::to_string_pretty;
+use serde_json::{Value, to_string_pretty};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Formatter, Write};
@@ -58,6 +58,8 @@ impl std::error::Error for MaxOutputTokensError {}
 /// Key used in ACP ToolCall meta to store the tool's programmatic name.
 /// This is a workaround since ACP's ToolCall doesn't have a dedicated name field.
 pub const TOOL_NAME_META_KEY: &str = "tool_name";
+/// Key used in ACP ContentChunk meta to preserve external-agent status/widget state.
+pub const STATUS_SURFACE_META_KEY: &str = "status_surface";
 
 /// Helper to extract tool name from ACP meta
 pub fn tool_name_from_meta(meta: &Option<acp::Meta>) -> Option<SharedString> {
@@ -91,6 +93,79 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp::Meta>) -> Option<Subag
     meta.as_ref()
         .and_then(|m| m.get(SUBAGENT_SESSION_INFO_META_KEY))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalStatusSurface {
+    pub kind: SharedString,
+    pub key: Option<SharedString>,
+    pub text: Option<SharedString>,
+    pub title: Option<SharedString>,
+    pub placement: Option<SharedString>,
+    pub severity: Option<SharedString>,
+    pub progress: Option<SharedString>,
+    pub lines: Vec<SharedString>,
+    pub clear: bool,
+}
+
+impl ExternalStatusSurface {
+    fn from_meta(meta: Option<&acp::Meta>) -> Option<Self> {
+        let surface = meta?.get(STATUS_SURFACE_META_KEY)?.as_object()?;
+        let kind = string_field(surface, "kind").unwrap_or_else(|| "status".into());
+        let lines = surface
+            .get("lines")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|line| line.to_owned().into())
+            .collect();
+
+        Some(Self {
+            kind,
+            key: string_field(surface, "key"),
+            text: string_field(surface, "text"),
+            title: string_field(surface, "title"),
+            placement: string_field(surface, "placement"),
+            severity: string_field(surface, "severity").or_else(|| string_field(surface, "level")),
+            progress: display_field(surface, "progress"),
+            lines,
+            clear: surface
+                .get("clear")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+
+    fn storage_key(&self) -> String {
+        let key = self.key.as_ref().unwrap_or(&self.kind);
+        format!("{}:{}", self.kind.as_ref(), key.as_ref())
+    }
+
+    fn should_store(&self) -> bool {
+        !matches!(self.kind.as_ref(), "transient" | "editor_text")
+    }
+}
+
+fn content_block_is_empty(block: &acp::ContentBlock) -> bool {
+    matches!(block, acp::ContentBlock::Text(text) if text.text.is_empty())
+}
+
+fn string_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<SharedString> {
+    object
+        .get(key)?
+        .as_str()
+        .map(|value| value.to_owned().into())
+}
+
+fn display_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<SharedString> {
+    let value = object.get(key)?;
+    match value {
+        Value::String(value) => Some(value.to_owned().into()),
+        Value::Number(value) => Some(value.to_string().into()),
+        Value::Bool(value) => Some(value.to_string().into()),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -1122,6 +1197,8 @@ pub struct AcpThread {
     cost: Option<SessionCost>,
     prompt_capabilities: acp::PromptCapabilities,
     available_commands: Vec<acp::AvailableCommand>,
+    external_status_surfaces: HashMap<String, ExternalStatusSurface>,
+    external_status_surface_entry_indices: HashMap<String, usize>,
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
     terminals: HashMap<acp::TerminalId, Entity<Terminal>>,
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
@@ -1187,6 +1264,7 @@ pub enum AcpThreadEvent {
     ModeUpdated(acp::SessionModeId),
     ConfigOptionsUpdated(Vec<acp::SessionConfigOption>),
     WorkingDirectoriesUpdated,
+    ExternalStatusSurfaceUpdated(ExternalStatusSurface),
 }
 
 impl EventEmitter<AcpThreadEvent> for AcpThread {}
@@ -1331,6 +1409,8 @@ impl AcpThread {
             cost: None,
             prompt_capabilities,
             available_commands: Vec::new(),
+            external_status_surfaces: HashMap::default(),
+            external_status_surface_entry_indices: HashMap::default(),
             _observe_prompt_capabilities: task,
             terminals: HashMap::default(),
             pending_terminal_output: HashMap::default(),
@@ -1352,6 +1432,10 @@ impl AcpThread {
 
     pub fn available_commands(&self) -> &[acp::AvailableCommand] {
         &self.available_commands
+    }
+
+    pub fn external_status_surfaces(&self) -> &HashMap<String, ExternalStatusSurface> {
+        &self.external_status_surfaces
     }
 
     pub fn is_draft_thread(&self) -> bool {
@@ -1551,7 +1635,20 @@ impl AcpThread {
                     self.push_user_content_block(None, content, cx);
                 }
             }
-            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) => {
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, meta, .. }) => {
+                if let Some(surface) = ExternalStatusSurface::from_meta(meta.as_ref()) {
+                    let content_is_empty = content_block_is_empty(&content);
+                    let entry_ix = self.external_status_surface_entry_ix(content_is_empty);
+                    if surface.clear {
+                        self.remove_external_status_surface(&surface.storage_key());
+                    } else if surface.should_store() {
+                        self.store_external_status_surface(surface.clone(), entry_ix);
+                    }
+                    cx.emit(AcpThreadEvent::ExternalStatusSurfaceUpdated(surface));
+                    if content_is_empty {
+                        return Ok(());
+                    }
+                }
                 self.push_assistant_content_block(content, false, cx);
             }
             acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk { content, .. }) => {
@@ -1733,6 +1830,49 @@ impl AcpThread {
                 }),
                 cx,
             );
+        }
+    }
+
+    fn external_status_surface_entry_ix(&self, content_is_empty: bool) -> usize {
+        if content_is_empty {
+            return self.entries.len();
+        }
+
+        if let Some(AgentThreadEntry::AssistantMessage(AssistantMessage {
+            indented: false, ..
+        })) = self.entries.last()
+        {
+            self.entries.len().saturating_sub(1)
+        } else {
+            self.entries.len()
+        }
+    }
+
+    fn store_external_status_surface(&mut self, surface: ExternalStatusSurface, entry_ix: usize) {
+        let storage_key = surface.storage_key();
+        self.external_status_surfaces
+            .insert(storage_key.clone(), surface);
+        self.external_status_surface_entry_indices
+            .insert(storage_key, entry_ix);
+    }
+
+    fn remove_external_status_surface(&mut self, storage_key: &str) {
+        self.external_status_surfaces.remove(storage_key);
+        self.external_status_surface_entry_indices
+            .remove(storage_key);
+    }
+
+    fn remove_external_status_surfaces_from(&mut self, entry_ix: usize) {
+        let removed_keys = self
+            .external_status_surface_entry_indices
+            .iter()
+            .filter_map(|(key, surface_entry_ix)| {
+                (*surface_entry_ix >= entry_ix).then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for key in removed_keys {
+            self.remove_external_status_surface(&key);
         }
     }
 
@@ -2487,6 +2627,7 @@ impl AcpThread {
                                     // User prompt was refused - truncate back to before the user message
                                     let range = user_msg_ix..this.entries.len();
                                     if range.start < range.end {
+                                        this.remove_external_status_surfaces_from(user_msg_ix);
                                         this.entries.truncate(user_msg_ix);
                                         cx.emit(AcpThreadEvent::EntriesRemoved(range));
                                     }
@@ -2609,6 +2750,7 @@ impl AcpThread {
                         .collect();
 
                     let range = ix..this.entries.len();
+                    this.remove_external_status_surfaces_from(ix);
                     this.entries.truncate(ix);
                     cx.emit(AcpThreadEvent::EntriesRemoved(range));
 
@@ -3705,6 +3847,373 @@ mod tests {
 
             "#}
         );
+    }
+
+    #[gpui::test]
+    async fn test_agent_message_chunk_preserves_external_status_surface(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("Pi status [circle]: ready".into()).meta(
+                            acp::Meta::from_iter([(
+                                STATUS_SURFACE_META_KEY.into(),
+                                json!({
+                                    "kind": "persistent_status",
+                                    "key": "circle",
+                                    "text": "ready",
+                                    "placement": "footer",
+                                    "severity": "warning",
+                                    "progress": 45,
+                                    "lines": ["ready", "healthy"]
+                                }),
+                            )]),
+                        ),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            let surface = thread
+                .external_status_surfaces()
+                .get("persistent_status:circle")
+                .expect("status surface metadata should be preserved");
+            assert_eq!(surface.kind.as_ref(), "persistent_status");
+            assert_eq!(surface.key.as_ref().map(AsRef::as_ref), Some("circle"));
+            assert_eq!(surface.text.as_ref().map(AsRef::as_ref), Some("ready"));
+            assert_eq!(
+                surface.placement.as_ref().map(AsRef::as_ref),
+                Some("footer")
+            );
+            assert_eq!(
+                surface.severity.as_ref().map(AsRef::as_ref),
+                Some("warning")
+            );
+            assert_eq!(surface.progress.as_ref().map(AsRef::as_ref), Some("45"));
+            assert_eq!(surface.lines.len(), 2);
+            assert!(
+                !thread.external_status_surfaces().contains_key("circle"),
+                "surface storage should include kind to avoid status/widget key collisions"
+            );
+            assert!(
+                thread.to_markdown(cx).contains("Pi status [circle]: ready"),
+                "status transcript fallback should remain visible"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_message_chunk_clears_external_status_surface_without_transcript_noise(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("Pi status [circle]: ready".into()).meta(
+                            acp::Meta::from_iter([(
+                                STATUS_SURFACE_META_KEY.into(),
+                                json!({
+                                    "kind": "persistent_status",
+                                    "key": "circle",
+                                    "text": "ready"
+                                }),
+                            )]),
+                        ),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("".into()).meta(
+                        acp::Meta::from_iter([(
+                            STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "persistent_status",
+                                "key": "circle",
+                                "clear": true
+                            }),
+                        )]),
+                    )),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            assert!(
+                !thread
+                    .external_status_surfaces()
+                    .contains_key("persistent_status:circle"),
+                "clear metadata should remove the native status surface"
+            );
+            let markdown = thread.to_markdown(cx);
+            assert!(
+                markdown.matches("Pi status [circle]: ready").count() == 1,
+                "metadata-only clears should not append additional transcript text"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_status_surface_storage_keys_include_kind(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            for (kind, text) in [
+                ("persistent_status", "ready"),
+                ("persistent_widget", "visible"),
+            ] {
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::AgentMessageChunk(
+                            acp::ContentChunk::new(format!("Pi {kind} [circle]: {text}").into())
+                                .meta(acp::Meta::from_iter([(
+                                    STATUS_SURFACE_META_KEY.into(),
+                                    json!({
+                                        "kind": kind,
+                                        "key": "circle",
+                                        "text": text
+                                    }),
+                                )])),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            }
+        });
+
+        thread.read_with(cx, |thread, _cx| {
+            let surfaces = thread.external_status_surfaces();
+            assert_eq!(
+                surfaces.len(),
+                2,
+                "status and widget surfaces with the same key should not overwrite each other"
+            );
+            assert_eq!(
+                surfaces
+                    .get("persistent_status:circle")
+                    .and_then(|surface| surface.text.as_ref())
+                    .map(AsRef::as_ref),
+                Some("ready")
+            );
+            assert_eq!(
+                surfaces
+                    .get("persistent_widget:circle")
+                    .and_then(|surface| surface.text.as_ref())
+                    .map(AsRef::as_ref),
+                Some("visible")
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("".into()).meta(
+                        acp::Meta::from_iter([(
+                            STATUS_SURFACE_META_KEY.into(),
+                            json!({
+                                "kind": "persistent_status",
+                                "key": "circle",
+                                "clear": true
+                            }),
+                        )]),
+                    )),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _cx| {
+            let surfaces = thread.external_status_surfaces();
+            assert!(
+                !surfaces.contains_key("persistent_status:circle"),
+                "clearing a status surface should remove only the matching kind/key"
+            );
+            assert!(
+                surfaces.contains_key("persistent_widget:circle"),
+                "clearing a status surface should not clear a widget with the same key"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_status_surface_skips_non_persistent_storage(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            for (kind, key, text) in [
+                ("transient", "warning", "Heads up"),
+                ("editor_text", "draft", "prefill"),
+            ] {
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::AgentMessageChunk(
+                            acp::ContentChunk::new(format!("Pi {kind}: {text}").into()).meta(
+                                acp::Meta::from_iter([(
+                                    STATUS_SURFACE_META_KEY.into(),
+                                    json!({
+                                        "kind": kind,
+                                        "key": key,
+                                        "text": text
+                                    }),
+                                )]),
+                            ),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            }
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            assert!(
+                thread.external_status_surfaces().is_empty(),
+                "transient and editor-text surfaces should not be retained invisibly"
+            );
+            let markdown = thread.to_markdown(cx);
+            assert!(
+                markdown.contains("Pi transient: Heads up"),
+                "transient transcript fallback should remain visible"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_rewind_removes_external_status_surfaces_from_truncated_entries(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            |request, thread, mut cx| {
+                async move {
+                    let acp::ContentBlock::Text(content) = &request.prompt[0] else {
+                        panic!("expected text prompt");
+                    };
+                    let key = content.text.to_lowercase();
+                    let text = format!("{} status", content.text);
+                    thread.update(&mut cx, |thread, cx| {
+                        thread
+                            .handle_session_update(
+                                acp::SessionUpdate::AgentMessageChunk(
+                                    acp::ContentChunk::new(text.clone().into()).meta(
+                                        acp::Meta::from_iter([(
+                                            STATUS_SURFACE_META_KEY.into(),
+                                            json!({
+                                                "kind": "persistent_status",
+                                                "key": key,
+                                                "text": text,
+                                            }),
+                                        )]),
+                                    ),
+                                ),
+                                cx,
+                            )
+                            .unwrap();
+                    })?;
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                }
+                .boxed_local()
+            },
+        ));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("First", cx))
+            .await
+            .unwrap();
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Second", cx))
+            .await
+            .unwrap();
+
+        thread.read_with(cx, |thread, _cx| {
+            let surfaces = thread.external_status_surfaces();
+            assert!(surfaces.contains_key("persistent_status:first"));
+            assert!(surfaces.contains_key("persistent_status:second"));
+        });
+
+        let second_message_id = thread.read_with(cx, |thread, _cx| {
+            let AgentThreadEntry::UserMessage(message) = &thread.entries[2] else {
+                panic!("expected second user message");
+            };
+            message.id.clone().unwrap()
+        });
+        thread
+            .update(cx, |thread, cx| thread.rewind(second_message_id, cx))
+            .await
+            .unwrap();
+
+        thread.read_with(cx, |thread, _cx| {
+            let surfaces = thread.external_status_surfaces();
+            assert!(
+                surfaces.contains_key("persistent_status:first"),
+                "status surface from retained history should remain"
+            );
+            assert!(
+                !surfaces.contains_key("persistent_status:second"),
+                "status surface from truncated history should be removed"
+            );
+        });
     }
 
     #[gpui::test]

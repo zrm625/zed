@@ -7,7 +7,7 @@ use crate::{
 use agent_client_protocol::schema as acp;
 use std::cell::RefCell;
 
-use acp_thread::{ContentBlock, PlanEntry};
+use acp_thread::{ContentBlock, ExternalStatusSurface, PlanEntry};
 use agent::{SkillLoadingError, SkillLoadingErrorsUpdated};
 use agent_settings::UserAgentsMd;
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
@@ -820,6 +820,123 @@ enum ToolCallLayout {
     Embedded,
 }
 
+const EXTERNAL_STATUS_SURFACE_SUMMARY_TEXT_LIMIT: usize = 160;
+const EXTERNAL_STATUS_SURFACE_SUMMARY_DETAIL_LIMIT: usize = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExternalStatusSurfaceSummary {
+    pub kind: SharedString,
+    pub label: SharedString,
+    pub value: SharedString,
+    pub details: Vec<SharedString>,
+}
+
+fn external_status_surface_summary(
+    surface: &ExternalStatusSurface,
+) -> Option<ExternalStatusSurfaceSummary> {
+    let label = surface
+        .title
+        .as_ref()
+        .or(surface.key.as_ref())
+        .unwrap_or(&surface.kind)
+        .clone();
+    let mut values = Vec::new();
+    if let Some(text) = surface.text.as_ref() {
+        values.push(text.clone());
+    }
+    values.extend(surface.lines.iter().cloned());
+    if values.is_empty()
+        && let Some(placement) = surface.placement.as_ref()
+    {
+        values.push(placement.clone());
+    }
+    let raw_value = values.first().cloned()?;
+    let value = bounded_external_status_surface_text(raw_value.clone());
+    let mut details = Vec::new();
+    if let Some(severity) = surface.severity.as_ref() {
+        details.push(format!("Severity: {}", severity.as_ref()).into());
+    }
+    if let Some(progress) = surface.progress.as_ref() {
+        details.push(format!("Progress: {}", progress.as_ref()).into());
+    }
+    if !matches!(surface.kind.as_ref(), "status" | "persistent_status")
+        && let Some(placement) = surface.placement.as_ref()
+        && raw_value != *placement
+    {
+        details.push(format!("Placement: {}", placement.as_ref()).into());
+    }
+    details.extend(values.into_iter().skip(1));
+    let details = bounded_external_status_surface_details(details);
+
+    Some(ExternalStatusSurfaceSummary {
+        kind: surface.kind.clone(),
+        label,
+        value,
+        details,
+    })
+}
+
+fn bounded_external_status_surface_text(text: SharedString) -> SharedString {
+    if text.as_ref().chars().count() <= EXTERNAL_STATUS_SURFACE_SUMMARY_TEXT_LIMIT {
+        return text;
+    }
+
+    let mut truncated = text
+        .as_ref()
+        .chars()
+        .take(EXTERNAL_STATUS_SURFACE_SUMMARY_TEXT_LIMIT.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated.into()
+}
+
+fn bounded_external_status_surface_details(details: Vec<SharedString>) -> Vec<SharedString> {
+    let omitted_count = details
+        .len()
+        .saturating_sub(EXTERNAL_STATUS_SURFACE_SUMMARY_DETAIL_LIMIT);
+    let mut bounded = details
+        .into_iter()
+        .take(EXTERNAL_STATUS_SURFACE_SUMMARY_DETAIL_LIMIT)
+        .map(bounded_external_status_surface_text)
+        .collect::<Vec<_>>();
+    if omitted_count > 0 {
+        bounded.push(format!("+{} more", omitted_count).into());
+    }
+    bounded
+}
+
+fn editor_text_content(surface: &ExternalStatusSurface) -> Option<Vec<acp::ContentBlock>> {
+    if surface.kind.as_ref() != "editor_text" {
+        return None;
+    }
+    if surface.clear {
+        return Some(Vec::new());
+    }
+    surface.text.as_ref().map(|text| {
+        vec![acp::ContentBlock::Text(acp::TextContent::new(
+            text.to_string(),
+        ))]
+    })
+}
+
+fn external_status_surface_icon(kind: &str) -> IconName {
+    match kind {
+        "widget" | "persistent_widget" => IconName::Blocks,
+        "title" => IconName::TextSnippet,
+        "status" | "persistent_status" => IconName::Circle,
+        _ => IconName::Info,
+    }
+}
+
+fn external_status_surface_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "widget" | "persistent_widget" => "Widget",
+        "title" => "Title",
+        "status" | "persistent_status" => "Status",
+        _ => "Surface",
+    }
+}
+
 fn full_path_for_empty_project_path(file: &dyn language::File, cx: &App) -> Option<String> {
     if file.path().file_name().is_some() {
         return None;
@@ -830,6 +947,21 @@ fn full_path_for_empty_project_path(file: &dyn language::File, cx: &App) -> Opti
 }
 
 impl ThreadView {
+    pub(crate) fn apply_external_status_surface(
+        &mut self,
+        surface: &ExternalStatusSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(content) = editor_text_content(surface) else {
+            return;
+        };
+
+        self.message_editor.update(cx, |editor, cx| {
+            editor.set_message(content, window, cx);
+        });
+    }
+
     pub(crate) fn new(
         root_thread_id: ThreadId,
         thread: Entity<AcpThread>,
@@ -2763,6 +2895,8 @@ impl ThreadView {
         let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
         let plan = thread.plan();
         let queue_is_empty = !self.has_queued_messages();
+        let external_status_surfaces = self.external_status_surface_summaries(cx);
+        let has_external_status_surfaces = !external_status_surfaces.is_empty();
 
         let awaiting_permission = self
             .render_main_agent_awaiting_permission(window, cx)
@@ -2772,6 +2906,7 @@ impl ThreadView {
         if changed_buffers.is_empty()
             && plan.is_empty()
             && queue_is_empty
+            && !has_external_status_surfaces
             && !has_awaiting_permission
         {
             return None;
@@ -2813,6 +2948,19 @@ impl ThreadView {
                         spread_radius: px(0.),
                         inset: false,
                     }])
+                    .when(has_external_status_surfaces, |this| {
+                        this.child(
+                            self.render_external_status_surfaces(external_status_surfaces, cx),
+                        )
+                    })
+                    .when(
+                        has_external_status_surfaces
+                            && (has_awaiting_permission
+                                || !plan.is_empty()
+                                || !changed_buffers.is_empty()
+                                || !queue_is_empty),
+                        |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+                    )
                     .when_some(awaiting_permission, |this, element| this.child(element))
                     .when(
                         has_awaiting_permission
@@ -2860,6 +3008,96 @@ impl ThreadView {
             )
             .into_any()
             .into()
+    }
+
+    pub(crate) fn external_status_surface_summaries(
+        &self,
+        cx: &App,
+    ) -> Vec<ExternalStatusSurfaceSummary> {
+        let mut summaries = self
+            .thread
+            .read(cx)
+            .external_status_surfaces()
+            .values()
+            .filter(|surface| !matches!(surface.kind.as_ref(), "transient" | "editor_text"))
+            .filter_map(external_status_surface_summary)
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| {
+            left.label
+                .as_ref()
+                .cmp(right.label.as_ref())
+                .then_with(|| left.value.as_ref().cmp(right.value.as_ref()))
+        });
+        summaries
+    }
+
+    fn render_external_status_surfaces(
+        &self,
+        summaries: Vec<ExternalStatusSurfaceSummary>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let count = summaries.len();
+
+        v_flex()
+            .child(
+                h_flex()
+                    .py_1()
+                    .px_2()
+                    .w_full()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        Label::new("Agent Surfaces")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(count.to_string()).size(LabelSize::Small)),
+            )
+            .child(
+                v_flex().children(summaries.into_iter().enumerate().map(|(ix, summary)| {
+                    let is_last = ix == count - 1;
+                    let icon = external_status_surface_icon(&summary.kind);
+                    let kind = external_status_surface_kind_label(&summary.kind);
+                    h_flex()
+                        .id(("external-status-surface", ix))
+                        .p_1()
+                        .pl_2()
+                        .min_w_0()
+                        .w_full()
+                        .gap_2()
+                        .justify_between()
+                        .bg(cx.theme().colors().editor_background)
+                        .when(!is_last, |this| {
+                            this.border_b_1().border_color(cx.theme().colors().border)
+                        })
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_1p5()
+                                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Accent))
+                                .child(Label::new(kind).size(LabelSize::XSmall).color(Color::Muted))
+                                .child(Label::new(summary.label).size(LabelSize::Small).truncate()),
+                        )
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .items_end()
+                                .child(
+                                    Label::new(summary.value)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                )
+                                .children(summary.details.into_iter().take(2).map(|detail| {
+                                    Label::new(detail)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .truncate()
+                                })),
+                        )
+                })),
+            )
     }
 
     fn render_edited_files(
