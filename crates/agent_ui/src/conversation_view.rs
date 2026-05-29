@@ -5817,6 +5817,13 @@ pub(crate) mod tests {
                             .is_some()
                     );
                     assert!(entry_view_state.entry(1).unwrap().has_content());
+                    assert_revealed_diff_editor_text(
+                        entry_view_state,
+                        &thread,
+                        1,
+                        "old content 1\nnew content 1",
+                        cx,
+                    );
 
                     // Old views should be dropped
                     assert!(entry_view_state.entry(2).is_none());
