@@ -67,7 +67,28 @@ const THREAD_ID_MIGRATION_KEY: &str = "thread-metadata-thread-id-backfill";
 pub(crate) fn list_thread_metadata_from_connection(
     connection: &db::sqlez::connection::Connection,
 ) -> anyhow::Result<Vec<ThreadMetadata>> {
-    connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY)?()
+    connection.select::<ThreadMetadata>(list_query_for_connection(connection)?)?()
+}
+
+fn list_query_for_connection(
+    connection: &db::sqlez::connection::Connection,
+) -> anyhow::Result<&'static str> {
+    if sidebar_threads_has_external_meta(connection)? {
+        Ok(ThreadMetadataDb::LIST_QUERY)
+    } else {
+        Ok(ThreadMetadataDb::LIST_QUERY_WITHOUT_EXTERNAL_META)
+    }
+}
+
+fn sidebar_threads_has_external_meta(
+    connection: &db::sqlez::connection::Connection,
+) -> anyhow::Result<bool> {
+    let count = connection.select_row_bound::<(), i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('sidebar_threads') \
+             WHERE name = 'external_meta'",
+    )?(())?
+    .unwrap_or(0);
+    Ok(count > 0)
 }
 
 /// Run the `ThreadMetadataDb` migrations on a raw connection.
@@ -83,6 +104,16 @@ pub(crate) fn run_thread_metadata_migrations(connection: &db::sqlez::connection:
             &mut |_, _, _| false,
         )
         .expect("thread metadata migrations should succeed");
+}
+
+#[cfg(test)]
+pub(crate) fn run_thread_metadata_migrations_without_external_meta(
+    connection: &db::sqlez::connection::Connection,
+) {
+    let migrations = &ThreadMetadataDb::MIGRATIONS[..ThreadMetadataDb::MIGRATIONS.len() - 1];
+    connection
+        .migrate(ThreadMetadataDb::NAME, migrations, &mut |_, _, _| false)
+        .expect("legacy thread metadata migrations should succeed");
 }
 
 pub fn init(cx: &mut App) {
@@ -1465,6 +1496,12 @@ impl ThreadMetadataDb {
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
         main_worktree_paths_order, remote_connection, title_override, external_meta \
+        FROM sidebar_threads \
+        ORDER BY updated_at DESC";
+    const LIST_QUERY_WITHOUT_EXTERNAL_META: &str = "SELECT thread_id, session_id, agent_id, \
+        title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, \
+        main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, \
+        NULL AS external_meta \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 

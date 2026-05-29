@@ -953,6 +953,19 @@ mod tests {
         connection
     }
 
+    fn create_legacy_channel_db_without_external_meta(
+        db_dir: &std::path::Path,
+        channel: ReleaseChannel,
+    ) -> db::sqlez::connection::Connection {
+        let db_path = db::db_path(db_dir, channel);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let connection = db::sqlez::connection::Connection::open_file(&db_path.to_string_lossy());
+        crate::thread_metadata_store::run_thread_metadata_migrations_without_external_meta(
+            &connection,
+        );
+        connection
+    }
+
     fn insert_thread(
         connection: &db::sqlez::connection::Connection,
         title: &str,
@@ -976,6 +989,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let threads = read_threads_from_channel(dir.path(), ReleaseChannel::Nightly).unwrap();
         assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn test_reads_legacy_channel_db_without_external_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection =
+            create_legacy_channel_db_without_external_meta(dir.path(), ReleaseChannel::Nightly);
+
+        insert_thread(&connection, "Legacy Thread", "2025-01-15T10:00:00Z", false);
+        drop(connection);
+
+        let threads = read_threads_from_channel(dir.path(), ReleaseChannel::Nightly).unwrap();
+        assert_eq!(threads.len(), 1);
+
+        let thread = &threads[0];
+        assert_eq!(thread.display_title().as_ref(), "Legacy Thread");
+        assert!(thread.meta.is_none());
     }
 
     #[test]
