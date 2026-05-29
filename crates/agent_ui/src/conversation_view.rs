@@ -318,6 +318,29 @@ impl Conversation {
         Some(options)
     }
 
+    pub fn session_id_for_tool_call(
+        &self,
+        preferred_session_id: &acp::SessionId,
+        tool_call_id: &acp::ToolCallId,
+        cx: &App,
+    ) -> Option<acp::SessionId> {
+        if self
+            .permission_options_for_tool_call(preferred_session_id, tool_call_id.clone(), cx)
+            .is_some()
+        {
+            return Some(preferred_session_id.clone());
+        }
+
+        self.permission_requests
+            .iter()
+            .filter(|(_, tool_call_ids)| tool_call_ids.iter().any(|id| id == tool_call_id))
+            .find_map(|(session_id, _)| {
+                self.permission_options_for_tool_call(session_id, tool_call_id.clone(), cx)
+                    .is_some()
+                    .then(|| session_id.clone())
+            })
+    }
+
     pub fn pending_tool_call<'a>(
         &'a self,
         session_id: &acp::SessionId,
@@ -7890,6 +7913,43 @@ pub(crate) mod tests {
         })
     }
 
+    fn request_test_required_text_prompt_authorization(
+        thread: &Entity<AcpThread>,
+        tool_call_id: &str,
+        option_id: &str,
+        cx: &mut TestAppContext,
+    ) -> Task<acp_thread::RequestPermissionOutcome> {
+        let tool_call_id = acp::ToolCallId::new(tool_call_id);
+        let label = format!("Tool {tool_call_id}");
+        let option_id = acp::PermissionOptionId::new(option_id);
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .request_tool_call_authorization(
+                        acp::ToolCall::new(tool_call_id, label)
+                            .kind(acp::ToolKind::Edit)
+                            .meta(acp::Meta::from_iter([(
+                                "text_prompt".into(),
+                                json!({
+                                    "mode": "input",
+                                    "label": "Required value",
+                                    "required": true,
+                                }),
+                            )]))
+                            .into(),
+                        PermissionOptions::Flat(vec![acp::PermissionOption::new(
+                            option_id,
+                            "Allow",
+                            acp::PermissionOptionKind::AllowOnce,
+                        )]),
+                        acp_thread::AuthorizationKind::PermissionGrant,
+                        cx,
+                    )
+                    .unwrap()
+            })
+        })
+    }
+
     #[gpui::test]
     async fn test_conversation_multiple_tool_calls_fifo_ordering(cx: &mut TestAppContext) {
         init_test(cx);
@@ -8445,6 +8505,119 @@ pub(crate) mod tests {
                 "Subagent permission requests should not trigger the main-agent floating row"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_required_subagent_text_prompt_blocks_root_pending_shortcut(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let root_view = active_thread(&conversation_view, cx);
+        let parent_session_id =
+            root_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        let project = root_view.read_with(cx, |view, cx| view.thread.read(cx).project().clone());
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+        let subagent_session_id = acp::SessionId::new("subagent-required-text");
+        let subagent_thread = cx.update(|_window, cx| {
+            create_test_acp_thread(
+                Some(parent_session_id.clone()),
+                "subagent-required-text",
+                connection,
+                project,
+                cx,
+            )
+        });
+        let subagent_view = conversation_view.update_in(cx, |view, window, cx| {
+            let conversation = view.as_connected().unwrap().conversation.clone();
+            conversation.update(cx, |conversation, cx| {
+                conversation.register_thread(subagent_thread.clone(), cx);
+            });
+            let subagent_view = view.new_thread_view(
+                subagent_thread.clone(),
+                conversation,
+                false,
+                None,
+                window,
+                cx,
+            );
+            view.as_connected_mut()
+                .unwrap()
+                .threads
+                .insert(subagent_session_id.clone(), subagent_view.clone());
+            subagent_view
+        });
+
+        let permission_task = request_test_required_text_prompt_authorization(
+            &subagent_thread,
+            "sub-required-text",
+            "allow-sub-required-text",
+            cx,
+        );
+        cx.run_until_parked();
+
+        root_view.update_in(cx, |view, window, cx| {
+            assert!(
+                view.authorize_pending_tool_call(acp::PermissionOptionKind::AllowOnce, window, cx)
+                    .is_none(),
+                "blank required subagent text prompt should block root pending shortcut"
+            );
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert!(
+                view.pending_tool_call(cx).is_some(),
+                "subagent tool call should still be pending after blocked blank allow"
+            );
+        });
+
+        let tool_call_id = acp::ToolCallId::new("sub-required-text");
+        subagent_view.update_in(cx, |view, window, cx| {
+            view.set_permission_text_prompt_value_for_test(
+                &tool_call_id,
+                "approved value",
+                window,
+                cx,
+            );
+        });
+
+        root_view.update_in(cx, |view, window, cx| {
+            assert!(
+                view.authorize_pending_tool_call(acp::PermissionOptionKind::AllowOnce, window, cx)
+                    .is_some(),
+                "root pending shortcut should authorize after subagent prompt value is supplied"
+            );
+        });
+        cx.run_until_parked();
+
+        match permission_task.await {
+            acp_thread::RequestPermissionOutcome::Selected(outcome) => {
+                assert_eq!(
+                    outcome
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("value"))
+                        .and_then(|value| value.as_str()),
+                    Some("approved value")
+                );
+            }
+            acp_thread::RequestPermissionOutcome::Cancelled => {
+                panic!("permission request should be selected")
+            }
+        }
     }
 
     #[gpui::test]

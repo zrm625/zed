@@ -358,11 +358,13 @@ impl ToolCall {
             self.status = status.into();
         }
 
-        if let Some(subagent_session_info) = subagent_session_info_from_meta(&meta) {
-            self.subagent_session_info = Some(subagent_session_info);
-        }
-        if meta.is_some() {
-            self.meta = meta;
+        if let Some(meta) = meta {
+            if let Some(subagent_session_info) =
+                subagent_session_info_from_meta(&Some(meta.clone()))
+            {
+                self.subagent_session_info = Some(subagent_session_info);
+            }
+            self.meta.get_or_insert_with(Default::default).extend(meta);
         }
 
         if let Some(title) = title {
@@ -4242,6 +4244,71 @@ mod tests {
             .unwrap();
 
         assert!(cx.read(|cx| !thread.read(cx).has_pending_edit_tool_calls()));
+    }
+
+    #[gpui::test]
+    async fn test_tool_call_update_meta_preserves_existing_entries(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let tool_call_id = acp::ToolCallId::new("meta-merge");
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(tool_call_id.clone(), "Needs text").meta(
+                            acp::Meta::from_iter([(
+                                "text_prompt".into(),
+                                json!({
+                                    "mode": "input",
+                                    "required": true,
+                                }),
+                            )]),
+                        ),
+                    ),
+                    cx,
+                )
+                .unwrap();
+
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::ToolCallUpdate(
+                        acp::ToolCallUpdate::new(
+                            tool_call_id.clone(),
+                            acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+                        )
+                        .meta(acp::Meta::from_iter([("other".into(), json!("value"))])),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _cx| {
+            let AgentThreadEntry::ToolCall(tool_call) = &thread.entries[0] else {
+                panic!("expected tool call");
+            };
+            let meta = tool_call
+                .meta
+                .as_ref()
+                .expect("tool metadata should remain");
+            assert!(
+                meta.contains_key("text_prompt"),
+                "partial tool-call update metadata should not drop existing text prompt metadata"
+            );
+            assert_eq!(
+                meta.get("other").and_then(|value| value.as_str()),
+                Some("value")
+            );
+        });
     }
 
     #[gpui::test(iterations = 10)]
