@@ -596,6 +596,7 @@ fn collect_importable_threads(
                 interacted_at: None,
                 worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
                 remote_connection: remote_connection.clone(),
+                meta: session.meta,
                 archived: true,
             });
         }
@@ -845,6 +846,37 @@ mod tests {
             .unwrap();
         assert_eq!(s1.agent_id.as_ref(), "agent-a");
         assert_eq!(s2.agent_id.as_ref(), "agent-b");
+    }
+
+    #[test]
+    fn test_collect_preserves_external_session_meta() {
+        let existing = HashSet::default();
+        let paths = PathList::new(&[Path::new("/project")]);
+        let lineage = serde_json::json!({
+            "parentSessionId": "parent-session",
+            "childSessionIds": ["child-session"],
+            "childSessionCount": 1,
+            "rootSessionId": "root-session",
+            "branchDepth": 2
+        });
+        let mut session = make_session("child-session", Some("Child"), Some(paths), None, None);
+        session.meta = Some(acp::Meta::from_iter([("pi".to_string(), lineage.clone())]));
+
+        let result = collect_importable_threads(
+            vec![SessionByAgent {
+                agent_id: AgentId::new("agent-a"),
+                remote_connection: None,
+                sessions: vec![session],
+            }],
+            existing,
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].meta.as_ref().and_then(|meta| meta.get("pi")),
+            Some(&lineage),
+            "external session lineage metadata should survive import into sidebar metadata"
+        );
     }
 
     #[test]

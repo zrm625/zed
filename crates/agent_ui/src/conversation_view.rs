@@ -4055,6 +4055,7 @@ pub(crate) mod tests {
                         interacted_at: None,
                         worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
                         remote_connection: None,
+                        meta: None,
                         archived: false,
                     },
                     cx,
