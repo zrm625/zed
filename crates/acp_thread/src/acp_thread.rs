@@ -336,6 +336,7 @@ pub struct ToolCall {
     pub raw_input: Option<serde_json::Value>,
     pub raw_input_markdown: Option<Entity<Markdown>>,
     pub raw_output: Option<serde_json::Value>,
+    pub meta: Option<acp::Meta>,
     pub tool_name: Option<SharedString>,
     pub subagent_session_info: Option<SubagentSessionInfo>,
 }
@@ -397,6 +398,7 @@ impl ToolCall {
             raw_input: tool_call.raw_input,
             raw_input_markdown,
             raw_output: tool_call.raw_output,
+            meta: tool_call.meta,
             tool_name,
             subagent_session_info,
         };
@@ -431,8 +433,13 @@ impl ToolCall {
             self.status = status.into();
         }
 
-        if let Some(subagent_session_info) = subagent_session_info_from_meta(&meta) {
-            self.subagent_session_info = Some(subagent_session_info);
+        if let Some(meta) = meta {
+            if let Some(subagent_session_info) =
+                subagent_session_info_from_meta(&Some(meta.clone()))
+            {
+                self.subagent_session_info = Some(subagent_session_info);
+            }
+            self.meta.get_or_insert_with(Default::default).extend(meta);
         }
 
         if let Some(title) = title {
@@ -608,11 +615,14 @@ pub enum SelectedPermissionParams {
     Terminal { patterns: Vec<String> },
 }
 
+const TERMINAL_PERMISSION_PATTERNS_META_KEY: &str = "zed_terminal_patterns";
+
 #[derive(Debug)]
 pub struct SelectedPermissionOutcome {
     pub option_id: acp::PermissionOptionId,
     pub option_kind: acp::PermissionOptionKind,
     pub params: Option<SelectedPermissionParams>,
+    pub meta: Option<acp::Meta>,
 }
 
 impl SelectedPermissionOutcome {
@@ -621,6 +631,7 @@ impl SelectedPermissionOutcome {
             option_id,
             option_kind,
             params: None,
+            meta: None,
         }
     }
 
@@ -628,12 +639,34 @@ impl SelectedPermissionOutcome {
         self.params = params;
         self
     }
+
+    pub fn meta(mut self, meta: Option<acp::Meta>) -> Self {
+        self.meta = meta;
+        self
+    }
 }
 
 impl From<SelectedPermissionOutcome> for acp::SelectedPermissionOutcome {
     fn from(value: SelectedPermissionOutcome) -> Self {
-        Self::new(value.option_id)
+        Self::new(value.option_id).meta(selected_permission_outcome_meta(value.meta, value.params))
     }
+}
+
+fn selected_permission_outcome_meta(
+    meta: Option<acp::Meta>,
+    params: Option<SelectedPermissionParams>,
+) -> Option<acp::Meta> {
+    let mut meta = meta.unwrap_or_default();
+    match params {
+        Some(SelectedPermissionParams::Terminal { patterns }) if !patterns.is_empty() => {
+            meta.insert(
+                TERMINAL_PERMISSION_PATTERNS_META_KEY.into(),
+                patterns.into(),
+            );
+        }
+        _ => {}
+    }
+    (!meta.is_empty()).then_some(meta)
 }
 
 #[derive(Debug)]
@@ -2081,6 +2114,7 @@ impl AcpThread {
                     raw_input: None,
                     raw_input_markdown: None,
                     raw_output: None,
+                    meta: None,
                     tool_name: None,
                     subagent_session_info: None,
                 };
@@ -3417,6 +3451,59 @@ mod tests {
         });
     }
 
+    #[test]
+    fn selected_permission_outcome_preserves_acp_meta() {
+        let outcome = SelectedPermissionOutcome::new(
+            acp::PermissionOptionId::new("submit"),
+            acp::PermissionOptionKind::AllowOnce,
+        )
+        .meta(Some(acp::Meta::from_iter([(
+            "value".into(),
+            "typed text".into(),
+        )])));
+
+        let acp_outcome = acp::SelectedPermissionOutcome::from(outcome);
+
+        assert_eq!(acp_outcome.option_id.0.as_ref(), "submit");
+        assert_eq!(
+            acp_outcome
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("value"))
+                .and_then(|value| value.as_str()),
+            Some("typed text")
+        );
+    }
+
+    #[test]
+    fn selected_permission_outcome_merges_terminal_params_into_meta() {
+        let outcome = SelectedPermissionOutcome::new(
+            acp::PermissionOptionId::new("allow"),
+            acp::PermissionOptionKind::AllowAlways,
+        )
+        .meta(Some(acp::Meta::from_iter([(
+            "existing".into(),
+            "kept".into(),
+        )])))
+        .params(Some(SelectedPermissionParams::Terminal {
+            patterns: vec!["npm test".to_string(), "cargo test".to_string()],
+        }));
+
+        let acp_outcome = acp::SelectedPermissionOutcome::from(outcome);
+        let meta = acp_outcome.meta.as_ref().unwrap();
+
+        assert_eq!(
+            meta.get("existing").and_then(|value| value.as_str()),
+            Some("kept")
+        );
+        assert_eq!(
+            meta.get(TERMINAL_PERMISSION_PATTERNS_META_KEY)
+                .and_then(|value| value.as_array())
+                .map(|patterns| patterns.len()),
+            Some(2)
+        );
+    }
+
     #[gpui::test]
     async fn test_terminal_output_buffered_before_created_renders(cx: &mut gpui::TestAppContext) {
         init_test(cx);
@@ -4751,6 +4838,71 @@ mod tests {
             let buffer = agent_location.buffer.upgrade().unwrap();
             let snapshot = buffer.read(cx).snapshot();
             assert_eq!(agent_location.position.to_point(&snapshot).row, target_line);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tool_call_update_meta_preserves_existing_entries(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let tool_call_id = acp::ToolCallId::new("meta-merge");
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(tool_call_id.clone(), "Needs text").meta(
+                            acp::Meta::from_iter([(
+                                "text_prompt".into(),
+                                json!({
+                                    "mode": "input",
+                                    "required": true,
+                                }),
+                            )]),
+                        ),
+                    ),
+                    cx,
+                )
+                .unwrap();
+
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::ToolCallUpdate(
+                        acp::ToolCallUpdate::new(
+                            tool_call_id.clone(),
+                            acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+                        )
+                        .meta(acp::Meta::from_iter([("other".into(), json!("value"))])),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _cx| {
+            let AgentThreadEntry::ToolCall(tool_call) = &thread.entries[0] else {
+                panic!("expected tool call");
+            };
+            let meta = tool_call
+                .meta
+                .as_ref()
+                .expect("tool metadata should remain");
+            assert!(
+                meta.contains_key("text_prompt"),
+                "partial tool-call update metadata should not drop existing text prompt metadata"
+            );
+            assert_eq!(
+                meta.get("other").and_then(|value| value.as_str()),
+                Some("value")
+            );
         });
     }
 
