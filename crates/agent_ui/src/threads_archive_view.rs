@@ -33,8 +33,8 @@ use settings::Settings as _;
 use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, Divider, KeyBinding, ListItem, ListItemSpacing, ListSubHeader, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, Tooltip, WithScrollbar, prelude::*,
-    utils::platform_title_bar_height,
+    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, Tooltip, WithScrollbar, WorktreeKind,
+    prelude::*, utils::platform_title_bar_height,
 };
 use ui_input::ErasedEditor;
 use util::ResultExt;
@@ -641,10 +641,14 @@ impl ThreadsArchiveView {
                     })
                     .unwrap_or_default();
 
-                let worktrees = worktree_info_from_thread_paths(
+                let mut worktrees = worktree_info_from_thread_paths(
                     &thread.worktree_paths,
                     &branch_names_for_thread,
                 );
+                if let Some(lineage) = session_lineage_worktree_info(thread.meta.as_ref()) {
+                    worktrees.push(lineage);
+                }
+                let lineage_depth = session_lineage_depth(thread.meta.as_ref());
 
                 let archived_color = Color::Custom(cx.theme().colors().icon_muted.opacity(0.6));
 
@@ -677,97 +681,106 @@ impl ThreadsArchiveView {
                     }));
 
                 if is_restoring {
-                    base.status(AgentThreadStatus::Running)
-                        .action_slot(
-                            IconButton::new("cancel-restore", IconName::Close)
+                    lineage_indented_thread_item(
+                        base.status(AgentThreadStatus::Running)
+                            .action_slot(
+                                IconButton::new("cancel-restore", IconName::Close)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Cancel Restore"))
+                                    .on_click({
+                                        let thread_id = thread.thread_id;
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.clear_restoring(&thread_id, cx);
+                                            cx.emit(ThreadsArchiveViewEvent::CancelRestore {
+                                                thread_id,
+                                            });
+                                            cx.stop_propagation();
+                                        })
+                                    }),
+                            )
+                            .into_any_element(),
+                        lineage_depth,
+                    )
+                } else if is_archived {
+                    lineage_indented_thread_item(
+                        base.action_slot(
+                            IconButton::new("delete-thread", IconName::Trash)
                                 .icon_size(IconSize::Small)
                                 .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text("Cancel Restore"))
+                                .tooltip({
+                                    move |_window, cx| {
+                                        Tooltip::for_action_in(
+                                            "Delete Thread",
+                                            &RemoveSelectedThread,
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    }
+                                })
                                 .on_click({
+                                    let agent = thread.agent_id.clone();
                                     let thread_id = thread.thread_id;
+                                    let session_id = thread.session_id.clone();
                                     cx.listener(move |this, _, _, cx| {
-                                        this.clear_restoring(&thread_id, cx);
-                                        cx.emit(ThreadsArchiveViewEvent::CancelRestore {
+                                        this.preserve_selection_on_next_update = true;
+                                        this.delete_thread(
                                             thread_id,
-                                        });
+                                            session_id.clone(),
+                                            agent.clone(),
+                                            cx,
+                                        );
                                         cx.stop_propagation();
                                     })
                                 }),
                         )
-                        .into_any_element()
-                } else if is_archived {
-                    base.action_slot(
-                        IconButton::new("delete-thread", IconName::Trash)
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .tooltip({
-                                move |_window, cx| {
-                                    Tooltip::for_action_in(
-                                        "Delete Thread",
-                                        &RemoveSelectedThread,
-                                        &focus_handle,
-                                        cx,
-                                    )
-                                }
+                        .on_click({
+                            let thread = thread.clone();
+                            cx.listener(move |this, _, window, cx| {
+                                this.unarchive_thread(thread.clone(), window, cx);
                             })
-                            .on_click({
-                                let agent = thread.agent_id.clone();
-                                let thread_id = thread.thread_id;
-                                let session_id = thread.session_id.clone();
-                                cx.listener(move |this, _, _, cx| {
-                                    this.preserve_selection_on_next_update = true;
-                                    this.delete_thread(
-                                        thread_id,
-                                        session_id.clone(),
-                                        agent.clone(),
-                                        cx,
-                                    );
-                                    cx.stop_propagation();
-                                })
-                            }),
-                    )
-                    .on_click({
-                        let thread = thread.clone();
-                        cx.listener(move |this, _, window, cx| {
-                            this.unarchive_thread(thread.clone(), window, cx);
                         })
-                    })
-                    .into_any_element()
+                        .into_any_element(),
+                        lineage_depth,
+                    )
                 } else {
-                    base.action_slot(
-                        IconButton::new("archive-thread", IconName::Archive)
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .tooltip({
-                                move |_window, cx| {
-                                    Tooltip::for_action_in(
-                                        "Archive Thread",
-                                        &ArchiveSelectedThread,
-                                        &focus_handle,
-                                        cx,
-                                    )
-                                }
-                            })
-                            .on_click({
-                                let thread_id = thread.thread_id;
-                                cx.listener(move |this, _, _, cx| {
-                                    this.archive_thread(thread_id, cx);
-                                    cx.stop_propagation();
+                    lineage_indented_thread_item(
+                        base.action_slot(
+                            IconButton::new("archive-thread", IconName::Archive)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip({
+                                    move |_window, cx| {
+                                        Tooltip::for_action_in(
+                                            "Archive Thread",
+                                            &ArchiveSelectedThread,
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    }
                                 })
-                            }),
-                    )
-                    .on_click({
-                        let thread = thread.clone();
-                        cx.listener(move |this, _, window, cx| {
-                            telemetry::event!(
-                                "Archived Thread Opened",
-                                agent = thread.agent_id.as_ref(),
-                                side = crate::agent_sidebar_side(cx)
-                            );
-                            this.unarchive_thread(thread.clone(), window, cx);
+                                .on_click({
+                                    let thread_id = thread.thread_id;
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.archive_thread(thread_id, cx);
+                                        cx.stop_propagation();
+                                    })
+                                }),
+                        )
+                        .on_click({
+                            let thread = thread.clone();
+                            cx.listener(move |this, _, window, cx| {
+                                telemetry::event!(
+                                    "Archived Thread Opened",
+                                    agent = thread.agent_id.as_ref(),
+                                    side = crate::agent_sidebar_side(cx)
+                                );
+                                this.unarchive_thread(thread.clone(), window, cx);
+                            })
                         })
-                    })
-                    .into_any_element()
+                        .into_any_element(),
+                        lineage_depth,
+                    )
                 }
             }
         }
@@ -1016,6 +1029,75 @@ pub fn format_history_entry_timestamp(entry_time: DateTime<Utc>) -> String {
     } else {
         format!("{}mo", months.max(1))
     }
+}
+
+fn session_lineage_worktree_info(meta: Option<&acp::Meta>) -> Option<ThreadItemWorktreeInfo> {
+    let pi_meta = meta?.get("pi")?;
+    let branch_depth = session_lineage_depth(meta);
+    let child_count = pi_meta
+        .get("childSessionCount")
+        .and_then(|value| value.as_u64())
+        .or_else(|| {
+            pi_meta
+                .get("childSessionIds")
+                .and_then(|value| value.as_array())
+                .map(|children| children.len() as u64)
+        })
+        .unwrap_or_default();
+
+    let label = session_lineage_label(branch_depth, child_count)?;
+    Some(ThreadItemWorktreeInfo {
+        worktree_name: None,
+        branch_name: Some(label.into()),
+        full_path: "".into(),
+        highlight_positions: Vec::new(),
+        kind: WorktreeKind::Linked,
+    })
+}
+
+fn lineage_indented_thread_item(element: AnyElement, branch_depth: u64) -> AnyElement {
+    let Some(indent) = session_lineage_indent_px(branch_depth) else {
+        return element;
+    };
+
+    h_flex()
+        .w_full()
+        .pl(px(indent))
+        .child(element)
+        .into_any_element()
+}
+
+fn session_lineage_depth(meta: Option<&acp::Meta>) -> u64 {
+    meta.and_then(|meta| meta.get("pi"))
+        .and_then(|pi_meta| pi_meta.get("branchDepth"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default()
+}
+
+fn session_lineage_indent_px(branch_depth: u64) -> Option<f32> {
+    if branch_depth == 0 {
+        None
+    } else {
+        Some((branch_depth.min(4) * 8) as f32)
+    }
+}
+
+fn session_lineage_label(branch_depth: u64, child_count: u64) -> Option<String> {
+    if branch_depth == 0 && child_count == 0 {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if branch_depth > 0 {
+        parts.push(format!("depth {branch_depth}"));
+    }
+    if child_count == 1 {
+        parts.push("1 child".to_string());
+    } else if child_count > 1 {
+        parts.push(format!("{child_count} children"));
+    }
+
+    Some(parts.join(", "))
 }
 
 impl Focusable for ThreadsArchiveView {
@@ -1679,5 +1761,50 @@ mod tests {
                 "position {pos} is not a valid UTF-8 boundary in {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_session_lineage_label_formats_depth_and_children() {
+        assert_eq!(session_lineage_label(0, 0), None);
+        assert_eq!(session_lineage_label(2, 0).as_deref(), Some("depth 2"));
+        assert_eq!(session_lineage_label(0, 1).as_deref(), Some("1 child"));
+        assert_eq!(
+            session_lineage_label(3, 2).as_deref(),
+            Some("depth 3, 2 children")
+        );
+    }
+
+    #[test]
+    fn test_session_lineage_worktree_info_reads_pi_meta() {
+        let meta = acp::Meta::from_iter([(
+            "pi".to_string(),
+            serde_json::json!({
+                "branchDepth": 2,
+                "childSessionIds": ["child-a", "child-b"]
+            }),
+        )]);
+
+        let info = session_lineage_worktree_info(Some(&meta))
+            .expect("lineage metadata should produce a visible history chip");
+
+        assert_eq!(info.worktree_name, None);
+        assert_eq!(info.branch_name.as_deref(), Some("depth 2, 2 children"));
+        assert_eq!(info.kind, WorktreeKind::Linked);
+    }
+
+    #[test]
+    fn test_session_lineage_depth_controls_bounded_history_indent() {
+        let meta = acp::Meta::from_iter([(
+            "pi".to_string(),
+            serde_json::json!({
+                "branchDepth": 6,
+            }),
+        )]);
+
+        assert_eq!(session_lineage_depth(Some(&meta)), 6);
+        assert_eq!(session_lineage_depth(None), 0);
+        assert_eq!(session_lineage_indent_px(0), None);
+        assert_eq!(session_lineage_indent_px(1), Some(8.0));
+        assert_eq!(session_lineage_indent_px(6), Some(32.0));
     }
 }

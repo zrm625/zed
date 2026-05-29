@@ -596,6 +596,7 @@ fn collect_importable_threads(
                 interacted_at: None,
                 worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
                 remote_connection: remote_connection.clone(),
+                meta: session.meta,
                 archived: true,
             });
         }
@@ -848,6 +849,37 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_preserves_external_session_meta() {
+        let existing = HashSet::default();
+        let paths = PathList::new(&[Path::new("/project")]);
+        let lineage = serde_json::json!({
+            "parentSessionId": "parent-session",
+            "childSessionIds": ["child-session"],
+            "childSessionCount": 1,
+            "rootSessionId": "root-session",
+            "branchDepth": 2
+        });
+        let mut session = make_session("child-session", Some("Child"), Some(paths), None, None);
+        session.meta = Some(acp::Meta::from_iter([("pi".to_string(), lineage.clone())]));
+
+        let result = collect_importable_threads(
+            vec![SessionByAgent {
+                agent_id: AgentId::new("agent-a"),
+                remote_connection: None,
+                sessions: vec![session],
+            }],
+            existing,
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].meta.as_ref().and_then(|meta| meta.get("pi")),
+            Some(&lineage),
+            "external session lineage metadata should survive import into sidebar metadata"
+        );
+    }
+
+    #[test]
     fn test_collect_deduplicates_across_agents() {
         let existing = HashSet::default();
         let paths = PathList::new(&[Path::new("/project")]);
@@ -921,6 +953,19 @@ mod tests {
         connection
     }
 
+    fn create_legacy_channel_db_without_external_meta(
+        db_dir: &std::path::Path,
+        channel: ReleaseChannel,
+    ) -> db::sqlez::connection::Connection {
+        let db_path = db::db_path(db_dir, channel);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let connection = db::sqlez::connection::Connection::open_file(&db_path.to_string_lossy());
+        crate::thread_metadata_store::run_thread_metadata_migrations_without_external_meta(
+            &connection,
+        );
+        connection
+    }
+
     fn insert_thread(
         connection: &db::sqlez::connection::Connection,
         title: &str,
@@ -944,6 +989,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let threads = read_threads_from_channel(dir.path(), ReleaseChannel::Nightly).unwrap();
         assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn test_reads_legacy_channel_db_without_external_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection =
+            create_legacy_channel_db_without_external_meta(dir.path(), ReleaseChannel::Nightly);
+
+        insert_thread(&connection, "Legacy Thread", "2025-01-15T10:00:00Z", false);
+        drop(connection);
+
+        let threads = read_threads_from_channel(dir.path(), ReleaseChannel::Nightly).unwrap();
+        assert_eq!(threads.len(), 1);
+
+        let thread = &threads[0];
+        assert_eq!(thread.display_title().as_ref(), "Legacy Thread");
+        assert!(thread.meta.is_none());
     }
 
     #[test]

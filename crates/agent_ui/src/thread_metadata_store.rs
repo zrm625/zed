@@ -67,7 +67,28 @@ const THREAD_ID_MIGRATION_KEY: &str = "thread-metadata-thread-id-backfill";
 pub(crate) fn list_thread_metadata_from_connection(
     connection: &db::sqlez::connection::Connection,
 ) -> anyhow::Result<Vec<ThreadMetadata>> {
-    connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY)?()
+    connection.select::<ThreadMetadata>(list_query_for_connection(connection)?)?()
+}
+
+fn list_query_for_connection(
+    connection: &db::sqlez::connection::Connection,
+) -> anyhow::Result<&'static str> {
+    if sidebar_threads_has_external_meta(connection)? {
+        Ok(ThreadMetadataDb::LIST_QUERY)
+    } else {
+        Ok(ThreadMetadataDb::LIST_QUERY_WITHOUT_EXTERNAL_META)
+    }
+}
+
+fn sidebar_threads_has_external_meta(
+    connection: &db::sqlez::connection::Connection,
+) -> anyhow::Result<bool> {
+    let count = connection.select_row_bound::<(), i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('sidebar_threads') \
+             WHERE name = 'external_meta'",
+    )?(())?
+    .unwrap_or(0);
+    Ok(count > 0)
 }
 
 /// Run the `ThreadMetadataDb` migrations on a raw connection.
@@ -83,6 +104,16 @@ pub(crate) fn run_thread_metadata_migrations(connection: &db::sqlez::connection:
             &mut |_, _, _| false,
         )
         .expect("thread metadata migrations should succeed");
+}
+
+#[cfg(test)]
+pub(crate) fn run_thread_metadata_migrations_without_external_meta(
+    connection: &db::sqlez::connection::Connection,
+) {
+    let migrations = &ThreadMetadataDb::MIGRATIONS[..ThreadMetadataDb::MIGRATIONS.len() - 1];
+    connection
+        .migrate(ThreadMetadataDb::NAME, migrations, &mut |_, _, _| false)
+        .expect("legacy thread metadata migrations should succeed");
 }
 
 pub fn init(cx: &mut App) {
@@ -141,6 +172,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                         interacted_at: None,
                         worktree_paths: WorktreePaths::from_folder_paths(&entry.folder_paths),
                         remote_connection: None,
+                        meta: None,
                         archived: true,
                     })
                 })
@@ -322,6 +354,7 @@ pub struct ThreadMetadata {
     pub interacted_at: Option<DateTime<Utc>>,
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
+    pub meta: Option<acp::Meta>,
     pub archived: bool,
 }
 
@@ -447,7 +480,7 @@ impl From<&ThreadMetadata> for acp_thread::AgentSessionInfo {
             title: meta.title(),
             updated_at: Some(meta.updated_at),
             created_at: meta.created_at,
-            meta: None,
+            meta: meta.meta.clone(),
         }
     }
 }
@@ -1329,6 +1362,7 @@ impl ThreadMetadataStore {
             updated_at,
             worktree_paths,
             remote_connection,
+            meta: existing_thread.and_then(|t| t.meta.clone()),
             archived,
         };
 
@@ -1442,6 +1476,9 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN external_meta TEXT;
+        ),
     ];
 }
 
@@ -1458,7 +1495,13 @@ impl ThreadMetadataDb {
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override \
+        main_worktree_paths_order, remote_connection, title_override, external_meta \
+        FROM sidebar_threads \
+        ORDER BY updated_at DESC";
+    const LIST_QUERY_WITHOUT_EXTERNAL_META: &str = "SELECT thread_id, session_id, agent_id, \
+        title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, \
+        main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, \
+        NULL AS external_meta \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -1508,13 +1551,19 @@ impl ThreadMetadataDb {
             .map(serde_json::to_string)
             .transpose()
             .context("serialize thread metadata remote connection")?;
+        let external_meta = row
+            .meta
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize thread metadata external metadata")?;
         let title_override = row.title_override.as_ref().map(|t| t.to_string());
         let thread_id = row.thread_id;
         let archived = row.archived;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, external_meta) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -1528,7 +1577,8 @@ impl ThreadMetadataDb {
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
-                           title_override = excluded.title_override";
+                           title_override = excluded.title_override, \
+                           external_meta = excluded.external_meta";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -1543,7 +1593,8 @@ impl ThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
-            stmt.bind(&title_override, i)?;
+            i = stmt.bind(&title_override, i)?;
+            stmt.bind(&external_meta, i)?;
             stmt.exec()
         })
         .await
@@ -1701,6 +1752,7 @@ impl Column for ThreadMetadata {
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (external_meta_json, next): (Option<String>, i32) = Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -1743,6 +1795,12 @@ impl Column for ThreadMetadata {
             .transpose()
             .context("deserialize thread metadata remote connection")?;
 
+        let meta = external_meta_json
+            .as_deref()
+            .map(serde_json::from_str::<acp::Meta>)
+            .transpose()
+            .context("deserialize thread metadata external metadata")?;
+
         let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
             .unwrap_or_else(|_| WorktreePaths::default());
 
@@ -1766,6 +1824,7 @@ impl Column for ThreadMetadata {
                 interacted_at,
                 worktree_paths,
                 remote_connection,
+                meta,
                 archived,
             },
             next,
@@ -1857,6 +1916,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
             remote_connection: None,
+            meta: None,
         }
     }
 
@@ -1951,6 +2011,49 @@ mod tests {
         assert_eq!(rows[0].title.as_deref(), Some("Agent Generated Title"));
         assert_eq!(rows[0].title_override.as_deref(), Some("User Title"));
         assert_eq!(rows[0].title().as_deref(), Some("User Title"));
+    }
+
+    #[gpui::test]
+    async fn test_database_round_trips_external_meta(_cx: &mut TestAppContext) {
+        let now = Utc::now();
+        let mut metadata = make_metadata(
+            "session-1",
+            "Agent Generated Title",
+            now,
+            PathList::new(&[Path::new("/project-a")]),
+        );
+        let lineage = serde_json::json!({
+            "parentSessionId": "parent-session",
+            "childSessionIds": ["child-session"],
+            "childSessionCount": 1,
+            "rootSessionId": "root-session",
+            "branchDepth": 2
+        });
+        metadata.meta = Some(acp::Meta::from_iter([("pi".to_string(), lineage.clone())]));
+
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        db.save(metadata).await.unwrap();
+
+        let rows = db.list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].meta.as_ref().and_then(|meta| meta.get("pi")),
+            Some(&lineage),
+            "external ACP session metadata should survive sidebar metadata persistence"
+        );
+
+        let session_info = acp_thread::AgentSessionInfo::from(&rows[0]);
+        assert_eq!(
+            session_info.meta.as_ref().and_then(|meta| meta.get("pi")),
+            Some(&lineage),
+            "persisted external metadata should flow back into AgentSessionInfo"
+        );
     }
 
     #[gpui::test]
@@ -2117,6 +2220,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&second_paths),
             remote_connection: None,
+            meta: None,
             archived: false,
         };
 
@@ -2202,6 +2306,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&project_a_paths),
             remote_connection: None,
+            meta: None,
             archived: false,
         };
 
@@ -2328,6 +2433,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&project_paths),
             remote_connection: None,
+            meta: None,
             archived: false,
         };
 
@@ -3073,6 +3179,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: linked_worktree_paths.clone(),
             remote_connection: None,
+            meta: None,
         };
 
         let remote_linked_thread = ThreadMetadata {
@@ -3087,6 +3194,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: linked_worktree_paths,
             remote_connection: Some(remote_a.clone()),
+            meta: None,
         };
 
         cx.update(|cx| {

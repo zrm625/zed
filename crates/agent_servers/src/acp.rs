@@ -2895,6 +2895,47 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn session_list_preserves_external_session_meta(cx: &mut gpui::TestAppContext) {
+        let circle_lineage_meta = serde_json::json!({
+            "pi": {
+                "parentSessionId": "parent-session",
+                "childSessionIds": ["child-session"],
+                "childSessionCount": 1,
+                "rootSessionId": "root-session",
+                "branchDepth": 2
+            }
+        });
+        let connection = connect_session_list_test_agent(
+            vec![
+                acp::SessionInfo::new("session-1", "/workspace")
+                    .title("Circle child")
+                    .meta(acp::Meta::from_iter([(
+                        "pi".to_string(),
+                        circle_lineage_meta["pi"].clone(),
+                    )])),
+            ],
+            cx,
+        )
+        .await;
+        let session_list = AcpSessionList::new(connection, false);
+
+        let response = cx
+            .update(|cx| session_list.list_sessions(AgentSessionListRequest::default(), cx))
+            .await
+            .expect("session list should load");
+        let session = response
+            .sessions
+            .first()
+            .expect("session list should include the returned session");
+
+        assert_eq!(
+            session.meta.as_ref().and_then(|meta| meta.get("pi")),
+            Some(&circle_lineage_meta["pi"]),
+            "external ACP session metadata should survive Zed's session/list mapping"
+        );
+    }
+
     fn set_acp_beta_override(cx: &mut App, value: &str) {
         let store = settings::SettingsStore::test(cx);
         cx.set_global(store);
